@@ -17,7 +17,10 @@
  * Version history:
  *   3 - external_pointer and downcount tail extensions.
  *   4 - cycle_budget, mirroring DolRecomp f0a86be, directly after downcount.
+ *   5 - gather-pipe inline staging (gather_pipe_base, gather_pipe_cursor,
+ *       gather_flush) at the tail; the module drains GPFifo's staging buffer
+ *       itself and only calls the host once a 32-byte block fills.
  */
-#define MODERNGEKKO_CPU_ABI_VERSION 4u
+#define MODERNGEKKO_CPU_ABI_VERSION 5u
 
 #endif

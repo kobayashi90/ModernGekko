@@ -69,6 +69,60 @@ int main() {
   invalid_netplay.graphics_backend = "Direct3D 9";
   if (moderngekko::frontend::SaveConfig(directory, invalid_netplay, &error))
     return 13;
+  // --- display, texture, language and state settings --------------------
+  // These are what the F1 menu writes; the boot path reads them back and turns
+  // the strings into enums, so a round trip has to preserve both the values and
+  // their spelling.
+  auto display_config = netplay_config;
+  display_config.language = "German";
+  display_config.aspect_ratio = "16:9";
+  display_config.widescreen_hack = true;
+  display_config.show_fps = true;
+  display_config.hires_textures = true;
+  display_config.cache_hires_textures = true;
+  display_config.state_slot = 7;
+  if (!moderngekko::frontend::SaveConfig(directory, display_config, &error))
+    return 14;
+  const auto display_loaded =
+      moderngekko::frontend::LoadConfig(directory, false);
+  if (!display_loaded || display_loaded.language != "German" ||
+      display_loaded.aspect_ratio != "16:9" || !display_loaded.widescreen_hack ||
+      !display_loaded.show_fps || !display_loaded.hires_textures ||
+      !display_loaded.cache_hires_textures || display_loaded.state_slot != 7) {
+    return 15;
+  }
+
+  // An unsupported value must be rejected instead of written: it would come back
+  // as a different setting, and the boot path would silently boot with the
+  // default while the file claims otherwise.
+  auto invalid_display = display_config;
+  invalid_display.language = "Klingon";
+  if (moderngekko::frontend::SaveConfig(directory, invalid_display, &error))
+    return 16;
+  invalid_display = display_config;
+  invalid_display.aspect_ratio = "21:9";
+  if (moderngekko::frontend::SaveConfig(directory, invalid_display, &error))
+    return 17;
+  invalid_display = display_config;
+  invalid_display.state_slot = 11;
+  if (moderngekko::frontend::SaveConfig(directory, invalid_display, &error))
+    return 18;
+
+  if (moderngekko::frontend::GameCubeLanguageValue("German") != 2 ||
+      moderngekko::frontend::GameCubeLanguageValue("Japanese") != 0 ||
+      moderngekko::frontend::GameCubeLanguageValue("Klingon") != -1) {
+    return 19;
+  }
+  // VideoCommon::AspectMode values: the boot path casts this straight into the
+  // Dolphin config, so a drifted table renders the game at the wrong ratio.
+  if (moderngekko::frontend::AspectRatioMode("auto") != 0 ||
+      moderngekko::frontend::AspectRatioMode("16:9") != 1 ||
+      moderngekko::frontend::AspectRatioMode("4:3") != 2 ||
+      moderngekko::frontend::AspectRatioMode("stretch") != 3 ||
+      moderngekko::frontend::AspectRatioMode("raw") != 6 ||
+      moderngekko::frontend::AspectRatioMode("21:9") != -1) {
+    return 20;
+  }
   if (!moderngekko::frontend::GenerateControllerConfig(
           directory, netplay_config.controllers, &error))
     return 3;

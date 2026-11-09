@@ -580,6 +580,12 @@ bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
       *state = saved;
     }
   }
+  // Nothing is intercepting guest code (no mods installed hooks/patches and no
+  // pending returns): skip the two hash probes. Hit once per dispatched
+  // address, so this is on the emulation hot path.
+  if (m_impl->hooks.empty() && m_impl->patches.empty() &&
+      m_impl->pending_returns.empty())
+    return false;
   const auto hooks = m_impl->hooks.find(address);
   if (hooks != m_impl->hooks.end()) {
     for (ModernGekkoModFunction function : hooks->second.entry) {
@@ -630,6 +636,9 @@ const std::vector<LoadedModInfo> &ModManager::GetLoadedMods() const {
 }
 
 bool ModManager::HandlesAddress(std::uint32_t address) const {
+  if (m_impl->patches.empty() && m_impl->hooks.empty() &&
+      m_impl->pending_returns.empty())
+    return false;
   if (m_impl->patches.contains(address) || m_impl->hooks.contains(address))
     return true;
   return std::ranges::any_of(m_impl->pending_returns,

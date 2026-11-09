@@ -7,9 +7,12 @@
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/VertexLoaderManager.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <string>
 
 VideoConfig g_Config;
 VideoConfig g_ActiveConfig;
@@ -46,9 +49,24 @@ GraphicsModGroupConfig::operator=(GraphicsModGroupConfig&&) noexcept = default;
 
 namespace Common::Log
 {
-void GenericLogFmtImpl(LogLevel, LogType, const char*, int, fmt::string_view,
-                       const fmt::format_args&)
+void GenericLogFmtImpl(LogLevel level, LogType, const char*, int, fmt::string_view msg,
+                       const fmt::format_args& args)
 {
+  // Errors/notices always reach stderr; set MG_LOG=1 for the full stream
+  // (the default stub swallowed diagnostics like GL init failures).
+  static const bool verbose = std::getenv("MG_LOG") != nullptr;
+  if (level > LogLevel::LERROR && !verbose)
+    return;
+  std::string text;
+  try
+  {
+    text = fmt::vformat(msg, args);
+  }
+  catch (...)
+  {
+    text.assign(msg.data(), msg.size());
+  }
+  std::fprintf(stderr, "[dolphin:%d] %s\n", static_cast<int>(level), text.c_str());
 }
 }
 

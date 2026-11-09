@@ -45,6 +45,25 @@ _Static_assert(offsetof(CPUState, spr_read) > offsetof(CPUState, exram_size),
 _Static_assert(offsetof(CPUState, cache_control) > offsetof(CPUState, spr_write),
                "cache_control must remain the final field");
 
+/* The ABI 5 tail: gather-pipe inline staging. The three fields must sit after
+ * everything else, in this order, each pointer-sized -- the module indexes
+ * them inline on the store hot path, so a shift is a wrong-offset read of a
+ * staging pointer. */
+_Static_assert(offsetof(CPUState, gather_pipe_base) > offsetof(CPUState, l1_win_msr),
+               "gather-pipe staging must remain a tail extension");
+_Static_assert(offsetof(CPUState, gather_pipe_cursor) >
+                   offsetof(CPUState, gather_pipe_base),
+               "gather_pipe_cursor must follow gather_pipe_base");
+_Static_assert(offsetof(CPUState, gather_flush) >
+                   offsetof(CPUState, gather_pipe_cursor),
+               "gather_flush must follow gather_pipe_cursor");
+_Static_assert(sizeof(((CPUState*)0)->gather_pipe_base) == sizeof(void*),
+               "gather_pipe_base is a pointer");
+_Static_assert(sizeof(((CPUState*)0)->gather_pipe_cursor) == sizeof(void*),
+               "gather_pipe_cursor is a pointer-to-pointer");
+_Static_assert(sizeof(((CPUState*)0)->gather_flush) == sizeof(void*),
+               "gather_flush is a function pointer");
+
 int main(void)
 {
     /* Everything here is checked at compile time. */

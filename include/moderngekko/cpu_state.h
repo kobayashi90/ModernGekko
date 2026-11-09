@@ -34,6 +34,9 @@ typedef uint32_t (*PPCSPRRead)(CPUState* cpu, uint16_t spr, uint32_t address);
 typedef void (*PPCSPRWrite)(CPUState* cpu, uint16_t spr, uint32_t value, uint32_t address);
 typedef void (*PPCCacheControl)(CPUState* cpu, uint8_t operation, uint32_t address,
                                 uint32_t instruction_address);
+/* Host-side drain for gather-pipe staging (ABI v5); see GXRuntime's core/cpu.h
+ * for the contract. Only reached when gather_pipe_base is non-NULL. */
+typedef void (*PPCGatherFlush)(CPUState* cpu);
 
 struct CPUState
 {
@@ -87,6 +90,30 @@ struct CPUState
     PPCSPRRead spr_read;
     PPCSPRWrite spr_write;
     PPCCacheControl cache_control;
+    /* Locked-L1 direct window (tail append: no existing field shifts).
+     * NULL while lockstep journaling is active so L1 stores stay on the MMU
+     * path (StaticRecompCore::Run sets these). Keep byte-identical with
+     * GXRuntime's core/cpu.h. */
+    uint8_t* l1_cache;
+    uint32_t l1_cache_size;
+    /* Identity-mapped locked-L1 window: host proves one page translates to
+     * itself under the recorded MSR, then the module serves those accesses
+     * inline. Tail append again; keep byte-identical with GXRuntime's
+     * core/cpu.h (tests/cpu_abi_conformance_test.c checks the layouts). */
+    uint8_t* l1_win_host;
+    uint32_t l1_win_page;
+    uint32_t l1_win_msr;
+    /* Write-gather-pipe staging (tail append: no existing field shifts). The
+     * module stages pipe stores (0xCC008000 page) into GPFifo's own buffer
+     * through gather_pipe_cursor (points at PPCState.gather_pipe_ptr, so the
+     * host count is live at every instant) and calls gather_flush once a
+     * 32-byte block fills. gather_pipe_base is the buffer base and NULL while
+     * lockstep journaling is active, which disables the path. Keep
+     * byte-identical with GXRuntime's core/cpu.h (tests/cpu_abi_conformance_
+     * test.c checks the layouts). */
+    uint8_t* gather_pipe_base;
+    uint8_t** gather_pipe_cursor;
+    PPCGatherFlush gather_flush;
 };
 
 #ifdef __cplusplus

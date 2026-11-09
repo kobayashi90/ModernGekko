@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace moderngekko
@@ -142,6 +143,9 @@ private:
   explicit Runtime(std::unique_ptr<Impl> impl);
   void StopAutomation();
   std::unique_ptr<Impl> m_impl;
+  // Declared after m_impl so it is destroyed (and joined) first: the thread
+  // reads m_impl, and a watchdog outliving it would be a use-after-free.
+  std::jthread m_stop_watchdog;
 };
 }  // namespace moderngekko
 

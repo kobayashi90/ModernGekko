@@ -10,6 +10,9 @@ namespace fs = std::filesystem;
 
 namespace moderngekko::frontend {
 namespace {
+KeyboardPadBindingsProvider s_keyboard_bindings = nullptr;
+GamepadPadBindingsProvider s_gamepad_bindings = nullptr;
+
 std::string Trim(std::string value) {
   const auto not_space = [](unsigned char c) { return !std::isspace(c); };
   value.erase(value.begin(),
@@ -91,6 +94,46 @@ const std::vector<GraphicsBackendOption> &SupportedGraphicsBackends() {
   return backends;
 }
 
+const std::vector<LanguageOption> &SupportedLanguages() {
+  // DiscIO::Language order, minus the Chinese/Korean entries: those exist for
+  // Wii SYSCONF only and no GameCube SRAM block can carry them.
+  static const std::vector<LanguageOption> languages = {
+      {"English", 1}, {"German", 2},  {"French", 3},
+      {"Spanish", 4}, {"Italian", 5}, {"Dutch", 6},
+      {"Japanese", 0},
+  };
+  return languages;
+}
+
+const std::vector<AspectRatioOption> &SupportedAspectRatios() {
+  // VideoCommon::AspectMode, in enum order.
+  static const std::vector<AspectRatioOption> ratios = {
+      {"Auto (detect)", "auto", 0},
+      {"16:9 widescreen", "16:9", 1},
+      {"4:3 standard", "4:3", 2},
+      {"Stretch to window", "stretch", 3},
+      {"Raw (no correction)", "raw", 6},
+  };
+  return ratios;
+}
+
+int GameCubeLanguageValue(std::string_view name) {
+  for (const LanguageOption &option : SupportedLanguages()) {
+    if (Lower(std::string(name)) == Lower(option.text))
+      return option.value;
+  }
+  return -1;
+}
+
+int AspectRatioMode(std::string_view value) {
+  for (const AspectRatioOption &option : SupportedAspectRatios()) {
+    if (Lower(std::string(value)) == option.value)
+      return option.mode;
+  }
+  return -1;
+}
+
+
 ConfigResult LoadConfig(const fs::path &user_directory,
                         bool create_if_missing) {
   const fs::path path = user_directory / "config.ini";
@@ -140,6 +183,56 @@ ConfigResult LoadConfig(const fs::path &user_directory,
     } else if (key == "fullscreen") {
       if (!ParseBoolean(value, &config.fullscreen))
         return {.error = "fullscreen must be true or false"};
+    } else if (key == "vsync") {
+      if (!ParseBoolean(value, &config.vsync))
+        return {.error = "vsync must be true or false"};
+    } else if (key == "language") {
+      if (GameCubeLanguageValue(raw_value) < 0)
+        return {.error = "language must be one of English, German, French, "
+                         "Spanish, Italian, Dutch, Japanese"};
+      config.language = raw_value;
+    } else if (key == "aspect_ratio") {
+      if (AspectRatioMode(raw_value) < 0)
+        return {.error = "aspect_ratio must be auto, 16:9, 4:3, stretch or raw"};
+      config.aspect_ratio = value;
+    } else if (key == "widescreen_hack") {
+      if (!ParseBoolean(value, &config.widescreen_hack))
+        return {.error = "widescreen_hack must be true or false"};
+    } else if (key == "show_fps") {
+      if (!ParseBoolean(value, &config.show_fps))
+        return {.error = "show_fps must be true or false"};
+    } else if (key == "hires_textures") {
+      if (!ParseBoolean(value, &config.hires_textures))
+        return {.error = "hires_textures must be true or false"};
+    } else if (key == "cache_hires_textures") {
+      if (!ParseBoolean(value, &config.cache_hires_textures))
+        return {.error = "cache_hires_textures must be true or false"};
+    } else if (key == "enable_cheats") {
+      if (!ParseBoolean(value, &config.enable_cheats))
+        return {.error = "enable_cheats must be true or false"};
+    } else if (key == "state_slot") {
+      int slot = 0;
+      const auto parsed = std::from_chars(
+          raw_value.data(), raw_value.data() + raw_value.size(), slot);
+      if (parsed.ec != std::errc{} ||
+          parsed.ptr != raw_value.data() + raw_value.size() || slot < 1 ||
+          slot > 10)
+        return {.error = "state_slot must be between 1 and 10"};
+      config.state_slot = slot;
+    } else if (key == "audio_backend") {
+      config.audio_backend = raw_value;
+    } else if (key == "volume") {
+      int volume = 0;
+      const auto parsed = std::from_chars(
+          raw_value.data(), raw_value.data() + raw_value.size(), volume);
+      if (parsed.ec != std::errc{} ||
+          parsed.ptr != raw_value.data() + raw_value.size() || volume < 0 ||
+          volume > 100)
+        return {.error = "volume must be between 0 and 100"};
+      config.volume = volume;
+    } else if (key == "mute") {
+      if (!ParseBoolean(value, &config.mute))
+        return {.error = "mute must be true or false"};
     } else if (key == "nickname")
       config.netplay_nickname = raw_value;
     else if (key == "address")
@@ -170,11 +263,17 @@ ConfigResult LoadConfig(const fs::path &user_directory,
   if (config.resolution.empty())
     return {.error = "config.ini is missing resolution=<width>x<height>"};
 
-  std::erase(config.controllers, std::string{});
+  // Keep empty slots so port N in the menu maps to GCPadN on disk.
   if (config.controllers.empty() && !config.controller.empty())
     config.controllers.push_back(config.controller);
-  if (config.controller.empty() && !config.controllers.empty())
-    config.controller = config.controllers.front();
+  if (config.controller.empty()) {
+    for (const auto &controller : config.controllers) {
+      if (!controller.empty()) {
+        config.controller = controller;
+        break;
+      }
+    }
+  }
   if (config.netplay_nickname.empty())
     return {.error = "netplay nickname cannot be empty"};
   if (config.netplay_nickname.size() > 30)
@@ -235,6 +334,22 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
       return false;
     }
   }
+  if (GameCubeLanguageValue(config.language) < 0 ||
+      config.language.find_first_of("\r\n") != std::string::npos) {
+    if (error)
+      *error = "language must be a supported GameCube language";
+    return false;
+  }
+  if (AspectRatioMode(config.aspect_ratio) < 0) {
+    if (error)
+      *error = "aspect_ratio must be auto, 16:9, 4:3, stretch or raw";
+    return false;
+  }
+  if (config.state_slot < 1 || config.state_slot > 10) {
+    if (error)
+      *error = "state_slot must be between 1 and 10";
+    return false;
+  }
   std::error_code ec;
   fs::create_directories(user_directory, ec);
   if (ec) {
@@ -250,13 +365,32 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
   }
   file << "# ModernGekko frontend settings\n"
           "# This is Dolphin's internal render target, not the window size.\n"
-          "[Video]\n"
+          "[Core]\n"
+          "language="
+       << config.language << '\n'
+       << "enable_cheats=" << (config.enable_cheats ? "true" : "false") << '\n'
+       << "[Video]\n"
           "resolution="
        << config.resolution << '\n'
        << "backend=" << graphics_backend << '\n'
        << "fullscreen=" << (config.fullscreen ? "true" : "false") << '\n'
        << "show_fps_in_title=" << (config.show_fps_in_title ? "true" : "false")
        << '\n'
+       << "vsync=" << (config.vsync ? "true" : "false") << '\n'
+       << "aspect_ratio=" << config.aspect_ratio << '\n'
+       << "widescreen_hack=" << (config.widescreen_hack ? "true" : "false")
+       << '\n'
+       << "show_fps=" << (config.show_fps ? "true" : "false") << '\n'
+       << "hires_textures=" << (config.hires_textures ? "true" : "false")
+       << '\n'
+       << "cache_hires_textures="
+       << (config.cache_hires_textures ? "true" : "false") << '\n'
+       << "[State]\n"
+       << "state_slot=" << config.state_slot << '\n'
+       << "[Audio]\n"
+       << "audio_backend=" << config.audio_backend << '\n'
+       << "volume=" << config.volume << '\n'
+       << "mute=" << (config.mute ? "true" : "false") << '\n'
        << "[Input]\n";
   for (std::size_t i = 0; i < config.controllers.size() && i < 4; ++i) {
     if (config.controllers[i].find_first_of("\r\n") != std::string::npos) {
@@ -336,6 +470,14 @@ bool ControllerConfigExists(const fs::path &user_directory) {
   return fs::is_regular_file(ControllerConfigPath(user_directory), ec);
 }
 
+void SetKeyboardPadBindingsProvider(KeyboardPadBindingsProvider provider) {
+  s_keyboard_bindings = provider;
+}
+
+void SetGamepadPadBindingsProvider(GamepadPadBindingsProvider provider) {
+  s_gamepad_bindings = provider;
+}
+
 bool GenerateControllerConfig(const fs::path &user_directory,
                               std::span<const std::string> controllers,
                               std::string *message) {
@@ -344,11 +486,13 @@ bool GenerateControllerConfig(const fs::path &user_directory,
       *message = "select between one and four connected SDL gamepads";
     return false;
   }
+  // Empty entries are allowed: they mean "no device on this port" and keep
+  // the GCPad1..4 slot alignment (a device chosen only for port 2 must not
+  // land on port 1).
   for (const std::string &controller : controllers) {
-    if (controller.empty() ||
-        controller.find_first_of("\r\n") != std::string_view::npos) {
+    if (controller.find_first_of("\r\n") != std::string_view::npos) {
       if (message)
-        *message = "select connected SDL gamepads";
+        *message = "controller device cannot contain a newline";
       return false;
     }
   }
@@ -370,8 +514,42 @@ bool GenerateControllerConfig(const fs::path &user_directory,
   for (std::size_t i = 0; i < 4; ++i) {
 #ifdef MODERNGEKKO_GAMECUBE_CONTROLLERS
     output << "[GCPad" << i + 1 << "]\n";
-    if (i >= controllers.size())
+    if (i >= controllers.size() || controllers[i].empty())
       continue;
+    // The menu passes the qualified form "Keyboard|<source/id/name>"; the
+    // bare "Keyboard" is the auto-detect form. Both go through the keyboard
+    // bindings provider.
+    if (controllers[i].starts_with("Keyboard")) {
+      if (!s_keyboard_bindings) {
+        if (message)
+          *message = "keyboard input is not available";
+        return false;
+      }
+      const std::string bindings = s_keyboard_bindings(controllers[i]);
+      if (bindings.empty()) {
+        if (message)
+          *message = "no keyboard input device was found";
+        return false;
+      }
+      output << bindings;
+      continue;
+    }
+    // The menu registers a gamepad bindings provider that walks the real
+    // device and writes input names matching the backend actually in use
+    // (evdev on this build). Without a provider (netplay/launcher paths)
+    // fall back to the SDL gamecontroller labels below.
+    if (s_gamepad_bindings) {
+      const std::string bindings = s_gamepad_bindings(controllers[i]);
+      if (bindings.empty()) {
+        if (message)
+          *message =
+              "gamepad device not found — refresh the device list and "
+              "re-select it";
+        return false;
+      }
+      output << bindings;
+      continue;
+    }
     output << "Device = " << controllers[i] << '\n'
            << "Buttons/A = `Button A`\n"
               "Buttons/B = `Button B`\n"

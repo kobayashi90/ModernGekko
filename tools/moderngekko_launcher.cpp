@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -38,6 +39,16 @@ namespace
 
 #ifndef MODERNGEKKO_RUNNER_FILENAME
 #define MODERNGEKKO_RUNNER_FILENAME "moderngekko-run"
+#endif
+
+#ifndef MODERNGEKKO_FRONTEND_VERSION
+#define MODERNGEKKO_FRONTEND_VERSION "1.0"
+#endif
+
+// Reverse-DNS application id used for Wayland's app_id: it is what the desktop
+// uses to group the window under one icon, so it must not be the frontend name.
+#ifndef MODERNGEKKO_APP_ID
+#define MODERNGEKKO_APP_ID "io.github.beachspikers.BeachSpikers"
 #endif
 
 #ifndef MODERNGEKKO_USER_DIRECTORY_NAME
@@ -204,6 +215,31 @@ bool ApplyBundledDolPatch(const fs::path& game_root, const fs::path& release_dir
 #endif
 }
 
+// The launcher's UI cannot be driven from a test on this box (no Xvfb, and a
+// real window would land on someone's desktop), so the first-run flow is
+// verified from its log lines instead: MODERNGEKKO_LAUNCHER_DEBUG=1 makes the
+// state transitions of the setup card visible from stderr.
+bool LauncherDebugEnabled()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("MODERNGEKKO_LAUNCHER_DEBUG");
+    return value && *value && *value != '0';
+  }();
+  return enabled;
+}
+
+void LauncherLog(const char* format, ...)
+{
+  if (!LauncherDebugEnabled())
+    return;
+  std::va_list args;
+  va_start(args, format);
+  std::fputs("[launcher] ", stderr);
+  std::vfprintf(stderr, format, args);
+  std::fputc('\n', stderr);
+  va_end(args);
+}
+
 fs::path DefaultGameFile(const fs::path& user_directory, const fs::path& release_directory)
 {
 #ifdef MODERNGEKKO_PORTABLE_DEFAULT_GAME
@@ -220,10 +256,61 @@ fs::path ReadDefaultGame(const fs::path& user_directory, const fs::path& release
   std::getline(file, value);
   if (!value.empty() && value.back() == '\r')
     value.pop_back();
+  // Empty means "nothing written yet": path("") is relative and resolving it
+  // returns the release directory, which then gets inspected as if it were a
+  // game. The runner had the same bug and died on "missing sys/main.dol".
+  if (value.empty())
+    return {};
   fs::path game(value);
   if (game.is_relative())
     game = release_directory / game;
   return game;
+}
+
+// Where ExtractDisc puts a game, and therefore where a previous run's extraction
+// can still be found. default-game.txt is the record of that, but it is a small
+// file in a user directory: it survives until someone deletes it, moves the
+// build, or runs the runner from a shell with --game (which never writes it).
+// Losing it used to make the launcher ask for the ISO again even though the
+// extracted game was sitting right there, so look for it before believing there
+// is no game.
+fs::path DiscoverExtractedGame(const fs::path& user_directory,
+                               const fs::path& release_directory)
+{
+  std::error_code ec;
+#ifdef MODERNGEKKO_PORTABLE_DEFAULT_GAME
+  const fs::path games_directory = release_directory / "Game";
+  if (fs::is_directory(games_directory, ec) && moderngekko::InspectGame(games_directory))
+    return games_directory;
+#else
+  const fs::path games_directory = user_directory / "games";
+  if (fs::is_directory(games_directory, ec))
+  {
+    std::vector<std::pair<fs::file_time_type, fs::path>> candidates;
+    for (const auto& entry : fs::directory_iterator(games_directory, ec))
+    {
+      if (!entry.is_directory(ec))
+        continue;
+      std::error_code time_error;
+      const fs::file_time_type written = fs::last_write_time(entry.path(), time_error);
+      candidates.emplace_back(time_error ? fs::file_time_type{} : written, entry.path());
+    }
+    // Newest first: with several extractions, the most recent one is what the
+    // player last used. Inspection rejects half-extracted or wrong-disc trees.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (const auto& [written, path] : candidates)
+    {
+      if (moderngekko::InspectGame(path))
+      {
+        LauncherLog("found an extracted game without default-game.txt: %s",
+                    path.string().c_str());
+        return path;
+      }
+    }
+  }
+#endif
+  return {};
 }
 
 bool WriteDefaultGame(const fs::path& user_directory, const fs::path& release_directory,
@@ -337,8 +424,8 @@ std::optional<fs::path> PrepareDisc(const fs::path& image, const fs::path& user_
   }
   return output;
 #else
-  *error = "this disc is not the pinned patched release";
-  return std::nullopt;
+  // No patched-release pinning for this title: accept the disc as-is.
+  return image;
 #endif
 }
 
@@ -487,6 +574,21 @@ void SDLCALL FileDialogCallback(void* userdata, const char* const* filelist, int
     state->selected = filelist[0];
 }
 
+// One place for the disc-image filter list and the starting folder, shared by
+// the first-run card and the settings page. SDL3's dialog is asynchronous, so
+// the result lands in DialogState::selected and is picked up by the main loop.
+void ShowDiscImageDialog(SDL_Window* window, DialogState* dialog)
+{
+  static constexpr SDL_DialogFileFilter filters[] = {
+      {"Disc images", "iso;wbfs;rvz"},
+      {"ISO", "iso"},
+      {"WBFS", "wbfs"},
+      {"RVZ", "rvz"}};
+  const std::string documents = DocumentsDirectory().string();
+  SDL_ShowOpenFileDialog(FileDialogCallback, dialog, window, filters,
+                         static_cast<int>(std::size(filters)), documents.c_str(), false);
+}
+
 fs::path SiblingRunner(const char* argv0)
 {
   std::error_code ec;
@@ -542,6 +644,12 @@ int main(int argc, char** argv)
 #if defined(__linux__)
   SDL_SetHint(SDL_HINT_VIDEO_DRIVER, use_wayland ? "wayland" : "x11");
 #endif
+  // Wayland (and X11's WM_CLASS) take the window's application identity from
+  // SDL's metadata, which otherwise defaults to the executable's name. Setting
+  // it here is what keeps the taskbar/dock entry reading the game's name
+  // instead of the frontend's.
+  SDL_SetAppMetadata(MODERNGEKKO_FRONTEND_NAME, MODERNGEKKO_FRONTEND_VERSION,
+                     MODERNGEKKO_APP_ID);
   SDL_setenv_unsafe("SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD", "1", 0);
   if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
     return 1;
@@ -581,7 +689,28 @@ int main(int argc, char** argv)
 
   std::vector<fs::path> images = FindDiscImages();
   std::optional<fs::path> selected_image = images.empty() ? std::nullopt : std::optional(images[0]);
+  // A disc image opened from a file manager ("Open With ...") arrives as an
+  // argument, and it should preselect itself: the player picked that exact
+  // file, so making them find it again in the dialog would be absurd. It only
+  // preselects -- Start still has to be pressed, because launching a game on
+  // top of whatever is already running is not something to do unasked.
+  for (int i = 1; i < argc; ++i)
+  {
+    if (argv[i][0] == '-')
+      continue;
+    std::error_code file_error;
+    const fs::path& argument = argv[i];
+    if (!fs::is_regular_file(argument, file_error))
+      continue;
+    fs::path canonical = fs::weakly_canonical(argument, file_error);
+    selected_image = file_error ? fs::path(argument) : std::move(canonical);
+    LauncherLog("preselected disc image from the command line: %s",
+                selected_image->string().c_str());
+    break;
+  }
   fs::path current_game = ReadDefaultGame(user_directory, release_directory);
+  if (current_game.empty())
+    current_game = DiscoverExtractedGame(user_directory, release_directory);
   bool current_dol_changed = false;
   std::string current_dol_error;
   auto current_metadata =
@@ -718,6 +847,25 @@ int main(int argc, char** argv)
   refresh_controllers();
   ExtractionState extraction;
   std::jthread extraction_thread;
+  // Kicks off disc extraction. Shared by the first-run card and the settings
+  // page so the two cannot drift apart.
+  const auto begin_extraction = [&](const fs::path& image)
+  {
+    extraction.completed = 0;
+    extraction.total = 1;
+    extraction.running = true;
+    {
+      std::lock_guard lock(extraction.mutex);
+      extraction.error.clear();
+      extraction.status.clear();
+      extraction.finished_game.reset();
+    }
+    extraction_thread = std::jthread([image, user_directory, release_directory, &extraction]
+                                     {
+                                       ExtractDisc(image, user_directory, release_directory,
+                                                   &extraction);
+                                     });
+  };
   enum class LaunchMode
   {
     None,
@@ -726,7 +874,33 @@ int main(int argc, char** argv)
     Join,
   };
   bool done = false;
+  bool first_run_card = false;
+  // Counts the frames the setup card has been drawn for, so its item rects are
+  // logged once (a per-frame log would be thousands of identical lines).
+  int card_frames = 0;
   LaunchMode launch_mode = LaunchMode::None;
+  // Debug aid: MODERNGEKKO_LAUNCHER_SHOT=<prefix> writes the first rendered
+  // frames to <prefix>-<n>.bmp. The setup card only ever appears in a GUI
+  // session, so without this there is no way to check its wording or layout
+  // short of asking someone to look: the offscreen video driver still renders
+  // for real, and SDL hands the pixels straight back.
+  const char* shot_prefix = SDL_getenv("MODERNGEKKO_LAUNCHER_SHOT");
+  int shot_index = 0;
+  const auto dump_frame = [&]
+  {
+    if (!shot_prefix || shot_index >= 3)
+      return;
+    SDL_Surface* frame = SDL_RenderReadPixels(renderer, nullptr);
+    if (!frame)
+      return;
+    const std::string path =
+        std::string(shot_prefix) + "-" + std::to_string(shot_index) + ".bmp";
+    if (SDL_SaveBMP(frame, path.c_str()))
+      ++shot_index;
+    else
+      SDL_Log("SDL_SaveBMP(%s) failed: %s", path.c_str(), SDL_GetError());
+    SDL_DestroySurface(frame);
+  };
   while (!done)
   {
     bool controllers_changed = false;
@@ -1036,36 +1210,12 @@ int main(int argc, char** argv)
     if (!extraction.running)
     {
       if (ImGui::Button("Browse for ISO / WBFS / RVZ"))
-      {
-        static constexpr SDL_DialogFileFilter filters[] = {
-            {"Disc images", "iso;wbfs;rvz"},
-            {"ISO", "iso"},
-            {"WBFS", "wbfs"},
-            {"RVZ", "rvz"}};
-        const std::string documents = DocumentsDirectory().string();
-        SDL_ShowOpenFileDialog(FileDialogCallback, &dialog, window, filters,
-                               static_cast<int>(std::size(filters)), documents.c_str(), false);
-      }
+        ShowDiscImageDialog(window, &dialog);
       if (selected_image)
       {
         ImGui::SameLine();
         if (ImGui::Button("Extract and Play"))
-        {
-          extraction.completed = 0;
-          extraction.total = 1;
-          extraction.running = true;
-          {
-            std::lock_guard lock(extraction.mutex);
-            extraction.error.clear();
-            extraction.finished_game.reset();
-          }
-          const fs::path image = *selected_image;
-          extraction_thread = std::jthread([image, user_directory, release_directory, &extraction]
-                                           {
-                                             ExtractDisc(image, user_directory,
-                                                         release_directory, &extraction);
-                                           });
-        }
+          begin_extraction(*selected_image);
       }
     }
     else
@@ -1092,11 +1242,170 @@ int main(int argc, char** argv)
     ImGui::TextWrapped("Controller: %s", controller_status.c_str());
     ImGui::End();
 
+    // --- First run: choose the disc image ---------------------------------
+    // A freshly unpacked build has no default-game.txt and no extracted game,
+    // so this modal is the first thing a new player sees. Nothing else in the
+    // window is useful before there is a game: settings without a game cannot
+    // be applied to anything.
+    //
+    // The popup is opened once (latch) but always ended once opened: ImGui
+    // keeps a modal in its popup stack until CloseCurrentPopup, and a modal that
+    // stops being drawn without being closed keeps swallowing input for the
+    // whole window. Extraction can finish without a launch when no gamepad is
+    // plugged in, so that case has to close the card explicitly.
+    if (!current_metadata && !first_run_card)
+    {
+      LauncherLog("first-run card opened (no game configured)");
+      ImGui::OpenPopup("##first_run");
+      first_run_card = true;
+      card_frames = 0;
+    }
+    if (first_run_card)
+    {
+      const ImGuiViewport* viewport_center = ImGui::GetMainViewport();
+      ImGui::SetNextWindowPos(
+          ImVec2(viewport_center->WorkPos.x + viewport_center->WorkSize.x * 0.5f,
+                 viewport_center->WorkPos.y + viewport_center->WorkSize.y * 0.5f),
+          ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+      ImGui::SetNextWindowSize(ImVec2(600 * scale, 0), ImGuiCond_Appearing);
+      if (ImGui::BeginPopupModal("##first_run", nullptr,
+                                 ImGuiWindowFlags_AlwaysAutoResize |
+                                     ImGuiWindowFlags_NoSavedSettings))
+      {
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8 * scale, 10 * scale));
+        // The card's item rectangles are logged for the first few frames so
+        // tools/firstrun-ui.sh can assert that every control is laid out inside
+        // the window: OCR proves the wording, these rects prove that a button
+        // was not pushed off the edge of the card (which is how the in-game
+        // menu lost its bottom row before it was split into tabs).
+        ++card_frames;
+        // Frames 2 and 3 are the settled layout: on the first frame the popup
+        // has not been centred yet and ImGui reports the pre-resize window
+        // size, which would make every assertion below read stale numbers.
+        const bool log_card_items = card_frames == 2 || card_frames == 3;
+        const auto log_card_item = [&](const char* label)
+        {
+          if (!log_card_items)
+            return;
+          const ImVec2 min = ImGui::GetItemRectMin();
+          const ImVec2 max = ImGui::GetItemRectMax();
+          LauncherLog("card item: %s x=%.0f y=%.0f w=%.0f h=%.0f", label, min.x,
+                      min.y, max.x - min.x, max.y - min.y);
+        };
+        ImGui::TextUnformatted("Welcome to");
+        ImGui::PushFont(nullptr, ImGui::GetFontSize() * 1.9f);
+        ImGui::TextUnformatted(MODERNGEKKO_FRONTEND_NAME);
+        ImGui::PopFont();
+        log_card_item("title");
+        ImGui::Spacing();
+        ImGui::TextWrapped(
+            "Choose your game disc image to start. It is extracted once into your "
+            "user folder; after that the game launches straight from here and the "
+            "original ISO is no longer needed.");
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Disc image:");
+        if (selected_image)
+          ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "%s",
+                             selected_image->string().c_str());
+        else
+          ImGui::TextDisabled("None selected yet");
+
+        if (!images.empty() && !extraction.running)
+        {
+          ImGui::Spacing();
+          ImGui::TextDisabled("Found these, if you would rather pick one of them:");
+          log_card_item("found");
+          for (std::size_t i = 0; i < images.size() && i < 6; ++i)
+          {
+            const bool picked = selected_image && *selected_image == images[i];
+            if (ImGui::Selectable(images[i].string().c_str(), picked))
+              selected_image = images[i];
+          }
+        }
+
+        ImGui::Spacing();
+        if (extraction.running)
+        {
+          const float progress = std::min(
+              1.0f, static_cast<float>(extraction.completed.load()) / extraction.total.load());
+          ImGui::ProgressBar(progress, ImVec2(-1, 0));
+          std::lock_guard lock(extraction.mutex);
+          if (!extraction.status.empty())
+            ImGui::TextWrapped("%s", extraction.status.c_str());
+        }
+        else
+        {
+          if (ImGui::Button("Choose disc image...", ImVec2(220 * scale, 40 * scale)))
+            ShowDiscImageDialog(window, &dialog);
+          log_card_item("choose");
+          ImGui::SameLine();
+          const bool can_start = selected_image.has_value();
+          ImGui::BeginDisabled(!can_start);
+          if (ImGui::Button("Start", ImVec2(140 * scale, 40 * scale)))
+            begin_extraction(*selected_image);
+          ImGui::EndDisabled();
+          log_card_item("start");
+          if (!can_start)
+          {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Pick an ISO, RVZ or WBFS file to continue.");
+            log_card_item("hint");
+          }
+        }
+
+        {
+          std::lock_guard lock(extraction.mutex);
+          if (!extraction.error.empty())
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "%s", extraction.error.c_str());
+        }
+        {
+          std::lock_guard lock(dialog.mutex);
+          if (!dialog.error.empty())
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "%s", dialog.error.c_str());
+        }
+        if (controllers.empty() && !controller_profile_exists)
+        {
+          ImGui::Spacing();
+          ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f),
+                             "No gamepad detected. Plug one in before starting - the game "
+                             "is played with a controller.");
+        }
+        ImGui::Spacing();
+        ImGui::Separator();
+        if (ImGui::Button("Quit", ImVec2(100 * scale, 32 * scale)))
+          done = true;
+        log_card_item("quit");
+        if (log_card_items)
+        {
+          const ImVec2 card = ImGui::GetWindowSize();
+          LauncherLog("card size: w=%.0f h=%.0f window=%.0fx%.0f", card.x, card.y,
+                      ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
+        }
+        // Extraction succeeded but nothing launched (normally: no gamepad), so
+        // dismiss the card and let the normal settings window take over.
+        if (current_metadata)
+        {
+          LauncherLog("first-run card closed (a game is now available)");
+          ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleVar();
+        ImGui::EndPopup();
+      }
+      else
+      {
+        // Closed (or never reopened): stop trying to draw it.
+        LauncherLog("first-run card dismissed");
+        first_run_card = false;
+      }
+    }
+
     ImGui::Render();
     SDL_SetRenderScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
     SDL_SetRenderDrawColor(renderer, 18, 20, 28, 255);
     SDL_RenderClear(renderer);
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
+    // Before the swap, while the backbuffer still holds this frame.
+    dump_frame();
     SDL_RenderPresent(renderer);
   }
 

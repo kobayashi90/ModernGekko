@@ -23,11 +23,14 @@
 #include "UICommon/UICommon.h"
 #include "VideoCommon/FrameDumper.h"
 #include "VideoCommon/PerformanceMetrics.h"
+#include "VideoCommon/Present.h"
 #include "VideoCommon/VideoEvents.h"
 #include "VideoCommon/VideoConfig.h"
 #include "automation_protocol.hpp"
 #include "dolphin_runtime_internal.hpp"
 #include "moderngekko/cpu_state.h"
+#include "moderngekko/hotkey.hpp"
+#include "moderngekko/window.hpp"
 #include "moderngekko/mod_loader.hpp"
 #include "moderngekko/module_loader.hpp"
 
@@ -54,7 +57,7 @@ std::mutex s_runtime_mutex;
 bool s_runtime_active = false;
 Platform *s_platform = nullptr;
 std::string s_window_title;
-bool s_show_fps_in_title = true;
+bool s_show_fps_in_title = false;
 bool s_external_ui_common = false;
 std::unique_ptr<BootSessionData> s_boot_session_data;
 u64 s_previous_net_wait_ns = 0;
@@ -109,6 +112,34 @@ PowerPC::CPUCore SelectCPUCore() {
 #endif
 }
 } // namespace
+
+namespace moderngekko {
+namespace {
+std::atomic<HotkeyCallback> s_hotkey_callback{nullptr};
+std::atomic<void *> s_hotkey_user_data{nullptr};
+} // namespace
+
+void SetHotkeyCallback(HotkeyCallback callback, void *user_data) {
+  s_hotkey_user_data.store(user_data);
+  s_hotkey_callback.store(callback);
+}
+
+bool NotifyHotkey(unsigned keysym) {
+  const HotkeyCallback callback = s_hotkey_callback.load();
+  if (!callback)
+    return false;
+  const bool claimed = callback(s_hotkey_user_data.load(), keysym);
+  std::fprintf(stderr, "[hotkey] sym=0x%x claimed=%d\n", keysym, claimed ? 1 : 0);
+  return claimed;
+}
+
+void SetWindowFullscreen(bool fullscreen) {
+  if (s_platform)
+    s_platform->RequestFullscreenChange(fullscreen);
+}
+
+bool IsWindowFullscreen() { return s_platform && s_platform->IsWindowFullscreen(); }
+} // namespace moderngekko
 
 std::vector<std::string> Host_GetPreferredLocales() { return {}; }
 void Host_PPCSymbolsChanged() {}
@@ -346,6 +377,41 @@ std::optional<RuntimeError> ApplyAutomationCommand(Runtime& runtime,
   case automation::CommandType::Stop:
     runtime.RequestStop();
     break;
+  case automation::CommandType::Hotkey:
+    // Same entry point the platform layer uses on a real key press, so the
+    // settings overlay's show/hide, pause/resume and config save all run.
+    moderngekko::NotifyHotkey(command.keysym);
+    break;
+  case automation::CommandType::Key:
+    // Same entry point as a physical key press, MINUS the hotkey callback:
+    // `hotkey` can only open the menu, this is what lets a test operate it.
+    if (g_presenter)
+      g_presenter->SetKeysym(command.keysym, command.key_down);
+    break;
+  case automation::CommandType::Mouse:
+  {
+    if (!g_presenter)
+      break;
+    // The platform layer owns a global button mask and republishes it on every
+    // event, so a press stays pressed. Automation has to do the same, or a
+    // `button=0 down=1` would be released by the next `button=0 down=0` of a
+    // different command while the menu still expects the drag to hold.
+    static u32 s_automation_mouse_buttons = 0;
+    if (command.has_mouse_position)
+      g_presenter->SetMousePos(command.mouse_x, command.mouse_y);
+    if (command.mouse_button >= 0)
+    {
+      const u32 bit = 1u << static_cast<u32>(command.mouse_button);
+      if (command.mouse_button_down)
+        s_automation_mouse_buttons |= bit;
+      else
+        s_automation_mouse_buttons &= ~bit;
+      g_presenter->SetMousePress(s_automation_mouse_buttons);
+    }
+    if (command.has_mouse_wheel)
+      g_presenter->SetMouseWheel(command.wheel_x, command.wheel_y);
+    break;
+  }
   }
   MarkAutomationCommand(state, command.source_name);
   return {};
@@ -363,6 +429,9 @@ bool AutomationCommandNeedsReadyCore(automation::CommandType type)
   case automation::CommandType::ReadMemory:
   case automation::CommandType::WriteMemory:
   case automation::CommandType::PadFrames:
+  case automation::CommandType::Hotkey:
+  case automation::CommandType::Key:
+  case automation::CommandType::Mouse:
     return true;
   case automation::CommandType::Pad:
   case automation::CommandType::ClearPad:
@@ -594,9 +663,12 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   auto impl = std::make_unique<Impl>();
   impl->config = std::move(config);
   impl->metadata = std::move(*inspected.metadata);
-  impl->title = impl->config.window_title.value_or(
-      "ModernGekko - " + impl->metadata.game_name + " [" +
-      impl->metadata.disc_id + "]");
+  // Title is the game's name and nothing else. This is a player-facing window:
+  // the emulator's own name and the disc ID are build details, not something a
+  // player needs on their taskbar. A branded build can still override it with
+  // MODERNGEKKO_DEFAULT_WINDOW_TITLE / --title.
+  impl->title =
+      impl->config.window_title.value_or(impl->metadata.game_name);
   impl->mods = std::make_unique<ModManager>();
   const ModLoadReport mod_report = impl->mods->LoadDirectories(
       impl->config.mod_directories, impl->metadata.disc_id);
@@ -704,6 +776,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   recomp_source.host_call_contains = &ModManager::HostCallContains;
   recomp_source.host_call_range_contains =
       &ModManager::HostCallRangeContains;
+  recomp_source.host_call_active = &ModManager::HostCallActive;
   recomp_source.host_call_user = impl->mods.get();
   jit.SetStaticRecompModuleSource(std::move(recomp_source));
 
@@ -711,6 +784,15 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   s_platform = impl->platform.get();
   s_window_title = impl->title;
   s_show_fps_in_title = impl->config.show_fps_in_title;
+  const bool headless = impl->config.headless;
+  // Push the title once, here, while the platform and the title are both known.
+  // Host_UpdateTitle has no other caller in the non-FPS case: Core::UpdateTitle
+  // fires during boot and can run before s_platform is set, and the periodic
+  // refresh thread only exists when the FPS counter is enabled. Without this,
+  // turning the counter off left X11 with no WM_NAME at all (the window had no
+  // title) and Wayland showing whatever name the toplevel was created with.
+  if (!headless)
+    Host_UpdateTitle({});
   return {std::unique_ptr<Runtime>(new Runtime(std::move(impl))), {}};
 }
 
@@ -737,7 +819,7 @@ Runtime::~Runtime() {
   std::lock_guard lock(s_runtime_mutex);
   s_platform = nullptr;
   s_window_title.clear();
-  s_show_fps_in_title = true;
+  s_show_fps_in_title = false;
   s_runtime_active = false;
 }
 
@@ -827,8 +909,34 @@ RuntimeRunResult Runtime::Run() {
 }
 
 void Runtime::RequestStop() {
-  if (m_impl && m_impl->platform)
-    m_impl->platform->RequestShutdown();
+  if (!m_impl || !m_impl->platform)
+    return;
+  m_impl->platform->RequestShutdown();
+  // Dolphin's no-GUI platform implements a stop request as a tap on the
+  // *emulated power button*: the guest is asked to shut down politely, and only
+  // a second request forces the process down (Platform::UpdateRunningFlag). Two
+  // situations leave that first request unanswered forever, and in both the
+  // user sees Quit do nothing at all:
+  //   * the guest has installed a shutdown hook and is paused -- the settings
+  //     menu pauses the core, so the tap can never be serviced;
+  //   * the guest installs no hook and simply never gets to the tap.
+  // So arm a watchdog that repeats the request shortly after, which is exactly
+  // the escalation the platform already implements. It only ever runs after the
+  // user asked to quit, and the repeat is harmless if the first one worked.
+  if (!m_stop_watchdog.joinable())
+  {
+    m_stop_watchdog = std::jthread([this](std::stop_token stop) {
+      for (int i = 0; i < 30 && !stop.stop_requested(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (stop.stop_requested())
+        return;
+      if (m_impl && m_impl->platform)
+      {
+        std::fprintf(stderr, "[runtime] stop not serviced in 3 s, forcing\n");
+        m_impl->platform->RequestShutdown();
+      }
+    });
+  }
 }
 
 std::optional<RuntimeError> Runtime::Pause() {

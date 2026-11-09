@@ -26,6 +26,8 @@ option(MODERNGEKKO_ENABLE_DISC_TOOL
        "Build Dolphin's disc conversion and verification tool" OFF)
 set(MODERNGEKKO_FRONTEND_NAME "ModernGekko" CACHE STRING
     "Branded frontend display name")
+set(MODERNGEKKO_APP_ID "" CACHE STRING
+    "Reverse-DNS application id (Wayland app_id / taskbar grouping)")
 set(MODERNGEKKO_LAUNCHER_OUTPUT_NAME "ModernGekko" CACHE STRING
     "Launcher executable filename without a platform suffix")
 set(MODERNGEKKO_RUNNER_OUTPUT_NAME "moderngekko-run" CACHE STRING
@@ -111,7 +113,15 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         set(ENABLE_CUBEB OFF CACHE BOOL "" FORCE)
     endif()
     set(ENABLE_HWDB OFF CACHE BOOL "" FORCE)
-    set(ENABLE_EVDEV OFF CACHE BOOL "" FORCE)
+    # The evdev backend supplies keyboard devices (needed for keyboard play
+    # on Wayland, where neither SDL nor X11 devices exist). It is Linux-only
+    # and unavailable inside a MODERNGEKKO_FRONTEND_SDK sysroot, so keep it
+    # off everywhere else.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT MODERNGEKKO_FRONTEND_SDK)
+        set(ENABLE_EVDEV ON CACHE BOOL "" FORCE)
+    else()
+        set(ENABLE_EVDEV OFF CACHE BOOL "" FORCE)
+    endif()
     set(ENABLE_WAYLAND ON CACHE BOOL "" FORCE)
     set(ENABLE_EGL OFF CACHE BOOL "" FORCE)
     set(USE_SYSTEM_SDL3 OFF CACHE BOOL "" FORCE)
@@ -191,6 +201,23 @@ add_library(moderngekko STATIC
     src/runtime/game.cpp
 )
 add_library(ModernGekko::Runtime ALIAS moderngekko)
+
+# The window platforms (X11/Wayland) name their toplevel from MODERNGEKKO_APP_ID
+# so the compositor can match the game window to the launcher's .desktop file.
+# The environment variable is the per-launch override; this is the built-in
+# default, so running the runner directly (a shell, a debugger, a test) still
+# gets the game's identity instead of a generic emulator one.
+if(MODERNGEKKO_APP_ID)
+    target_compile_definitions(moderngekko PRIVATE
+        MODERNGEKKO_DEFAULT_APP_ID="${MODERNGEKKO_APP_ID}")
+endif()
+# Same idea for the title the Wayland toplevel is created with: it is replaced
+# by the real title on the first frame, but until then the window list shows
+# whatever is set at creation time.
+if(MODERNGEKKO_DEFAULT_WINDOW_TITLE)
+    target_compile_definitions(moderngekko PRIVATE
+        MODERNGEKKO_DEFAULT_WINDOW_TITLE="${MODERNGEKKO_DEFAULT_WINDOW_TITLE}")
+endif()
 
 add_library(moderngekko_dolphin_video STATIC
     src/gpu/dolphin_video_host.cpp
@@ -415,6 +442,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     endif()
     add_executable(moderngekko-run
         tools/moderngekko_run.cpp
+        tools/config_menu.cpp
         tools/netplay_compatibility.cpp
         tools/netplay_session.cpp
         tools/frontend_config.cpp
@@ -453,6 +481,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         OUTPUT_NAME "${MODERNGEKKO_RUNNER_OUTPUT_NAME}")
     target_compile_definitions(moderngekko-run PRIVATE
         MODERNGEKKO_RUNNER_NAME="${MODERNGEKKO_RUNNER_OUTPUT_NAME}"
+        MODERNGEKKO_LAUNCHER_FILENAME="${MODERNGEKKO_LAUNCHER_OUTPUT_NAME}"
         MODERNGEKKO_USER_DIRECTORY_NAME="${MODERNGEKKO_USER_DIRECTORY_NAME}")
     if(MODERNGEKKO_DEFAULT_WINDOW_TITLE)
         target_compile_definitions(moderngekko-run PRIVATE
@@ -546,6 +575,10 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         MODERNGEKKO_RUNNER_FILENAME="${MODERNGEKKO_RUNNER_OUTPUT_NAME}"
         MODERNGEKKO_USER_DIRECTORY_NAME="${MODERNGEKKO_USER_DIRECTORY_NAME}"
         MODERNGEKKO_LOG_FILENAME="${MODERNGEKKO_LOG_FILENAME}")
+    if(MODERNGEKKO_APP_ID)
+        target_compile_definitions(moderngekko-launcher PRIVATE
+            MODERNGEKKO_APP_ID="${MODERNGEKKO_APP_ID}")
+    endif()
     if(MODERNGEKKO_REQUIRED_DISC_ID)
         target_compile_definitions(moderngekko-launcher PRIVATE
             MODERNGEKKO_REQUIRED_DISC_ID="${MODERNGEKKO_REQUIRED_DISC_ID}")

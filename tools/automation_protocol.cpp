@@ -73,6 +73,14 @@ std::string Trim(std::string_view value)
   return std::string(value.substr(first, last - first + 1));
 }
 
+std::string LowerAscii(std::string value)
+{
+  std::ranges::transform(value, value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
 std::optional<double> ParseDouble(std::string_view value)
 {
   const std::string text = Trim(value);
@@ -150,6 +158,16 @@ std::optional<std::vector<std::uint8_t>> ParseHexBytes(std::string_view value)
   return bytes;
 }
 
+std::optional<bool> ParseBool(std::string_view value)
+{
+  const std::string text = LowerAscii(Trim(value));
+  if (text == "1" || text == "true" || text == "down" || text == "press")
+    return true;
+  if (text == "0" || text == "false" || text == "up" || text == "release")
+    return false;
+  return std::nullopt;
+}
+
 std::optional<CommandType> ParseCommandType(std::string_view value)
 {
   const std::string text = Trim(value);
@@ -175,6 +193,12 @@ std::optional<CommandType> ParseCommandType(std::string_view value)
     return CommandType::WriteMemory;
   if (text == "stop")
     return CommandType::Stop;
+  if (text == "hotkey")
+    return CommandType::Hotkey;
+  if (text == "key")
+    return CommandType::Key;
+  if (text == "mouse")
+    return CommandType::Mouse;
   return std::nullopt;
 }
 
@@ -499,6 +523,128 @@ bool ParseCommandFile(const std::filesystem::path& path, Command* command, std::
     if (!ParseWriteMemoryCommand(values, &parsed, error))
       return false;
     break;
+  case CommandType::Hotkey:
+  {
+    const auto keysym_it = values.find("keysym");
+    if (keysym_it == values.end())
+    {
+      if (error)
+        *error = "hotkey commands require keysym=<X11 keysym, e.g. 0xFFBE for F1>";
+      return false;
+    }
+    const auto keysym = ParseUnsigned(keysym_it->second);
+    if (!keysym || *keysym == 0 || *keysym > 0x1FFFFFFF)
+    {
+      if (error)
+        *error = "keysym must be a non-zero X11 keysym (0x-prefixed hexadecimal or decimal)";
+      return false;
+    }
+    parsed.keysym = *keysym;
+    break;
+  }
+  case CommandType::Key:
+  {
+    const auto keysym_it = values.find("keysym");
+    if (keysym_it == values.end())
+    {
+      *error = "key commands require keysym=<X11 keysym, e.g. 0x20 for Space>";
+      return false;
+    }
+    const auto keysym = ParseUnsigned(keysym_it->second);
+    if (!keysym || *keysym == 0 || *keysym > 0x1FFFFFFF)
+    {
+      *error = "keysym must be a non-zero X11 keysym";
+      return false;
+    }
+    parsed.keysym = *keysym;
+    if (const auto down_it = values.find("down"); down_it != values.end())
+    {
+      const auto down = ParseBool(down_it->second);
+      if (!down)
+      {
+        *error = "key down= must be 0/1 (or up/down, press/release)";
+        return false;
+      }
+      parsed.key_down = *down;
+    }
+    break;
+  }
+  case CommandType::Mouse:
+  {
+    const auto x_it = values.find("x");
+    const auto y_it = values.find("y");
+    if (x_it != values.end() || y_it != values.end())
+    {
+      if (x_it == values.end() || y_it == values.end())
+      {
+        *error = "mouse position needs both x= and y=";
+        return false;
+      }
+      const auto x = ParseDouble(x_it->second);
+      const auto y = ParseDouble(y_it->second);
+      if (!x || !y)
+      {
+        *error = "mouse x/y must be numbers (backbuffer pixels)";
+        return false;
+      }
+      parsed.has_mouse_position = true;
+      parsed.mouse_x = static_cast<float>(*x);
+      parsed.mouse_y = static_cast<float>(*y);
+    }
+    if (const auto button_it = values.find("button"); button_it != values.end())
+    {
+      const auto button = ParseUnsigned(button_it->second);
+      if (!button || *button > 2)
+      {
+        *error = "mouse button= must be 0 (left), 1 (right) or 2 (middle)";
+        return false;
+      }
+      parsed.mouse_button = static_cast<int>(*button);
+      if (const auto down_it = values.find("down"); down_it != values.end())
+      {
+        const auto down = ParseBool(down_it->second);
+        if (!down)
+        {
+          *error = "mouse down= must be 0/1 (or up/down, press/release)";
+          return false;
+        }
+        parsed.mouse_button_down = *down;
+      }
+      else
+      {
+        parsed.mouse_button_down = true;
+      }
+    }
+    if (const auto wheel_it = values.find("wheel_y"); wheel_it != values.end())
+    {
+      const auto wheel = ParseDouble(wheel_it->second);
+      if (!wheel)
+      {
+        *error = "mouse wheel_y= must be a number";
+        return false;
+      }
+      parsed.has_mouse_wheel = true;
+      parsed.wheel_x = 0.0f;
+      if (const auto wheel_x_it = values.find("wheel_x"); wheel_x_it != values.end())
+      {
+        const auto wheel_x = ParseDouble(wheel_x_it->second);
+        if (!wheel_x)
+        {
+          *error = "mouse wheel_x= must be a number";
+          return false;
+        }
+        parsed.wheel_x = static_cast<float>(*wheel_x);
+      }
+      parsed.wheel_y = static_cast<float>(*wheel);
+    }
+    if (!parsed.has_mouse_position && parsed.mouse_button < 0 &&
+        !parsed.has_mouse_wheel)
+    {
+      *error = "mouse commands need x=/y=, button= or wheel_y=";
+      return false;
+    }
+    break;
+  }
   case CommandType::Pause:
   case CommandType::Resume:
   case CommandType::Stop:

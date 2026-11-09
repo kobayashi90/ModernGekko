@@ -24,6 +24,21 @@ enum class CommandType
   ReadMemory,
   WriteMemory,
   Stop,
+  // Delivers a keyboard keysym exactly as the platform layer would, so the
+  // settings overlay (and any other hotkey handler) can be exercised by a
+  // headless test run. Background consumers like a stuck screen locker can
+  // hold the compositor's keyboard focus, which makes real synthetic input
+  // undeliverable; this goes straight to the same callback.
+  Hotkey,
+  // Feeds one keysym into the OSD ImGui context (down or up) WITHOUT running
+  // the hotkey callback. `hotkey` only reaches the frontend's hotkey hook, so
+  // it can open the menu but cannot operate it; this is what makes widget
+  // interaction (tab switching, combos, checkboxes) testable headlessly.
+  Key,
+  // Moves the ImGui mouse and/or presses a button. Same reasoning as Key: the
+  // settings overlay is the only ImGui consumer that needs pointer input, and
+  // a headless test must be able to click it.
+  Mouse,
 };
 
 struct PadState
@@ -42,6 +57,20 @@ struct Command
   std::uint32_t address = 0;
   std::uint32_t size = 0;
   std::uint32_t frames = 0;
+  std::uint32_t keysym = 0;
+  // Key: true for a press, false for a release. Defaults to a press so a bare
+  // `command=key keysym=0x20` behaves like tapping the key once `down=0` is
+  // sent afterwards; the test harness always sends both explicitly.
+  bool key_down = true;
+  // Mouse: any subset of {position, button, wheel} may be present.
+  bool has_mouse_position = false;
+  float mouse_x = 0.0f;
+  float mouse_y = 0.0f;
+  int mouse_button = -1;  // 0 left, 1 right, 2 middle; -1 means "no button event"
+  bool mouse_button_down = false;
+  bool has_mouse_wheel = false;
+  float wheel_x = 0.0f;
+  float wheel_y = 0.0f;
   std::vector<std::uint8_t> data;
 };
 
