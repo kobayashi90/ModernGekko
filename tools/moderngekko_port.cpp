@@ -451,6 +451,29 @@ fs::path SiblingExecutable(const char* argv0, std::string name)
   return fs::is_regular_file(sibling) ? sibling : fs::path(std::move(name));
 }
 
+// Where the sources the module build needs live.
+//
+// A packaged release cannot use the compile-time source tree: a shipped
+// moderngekko-port.exe would otherwise reference the CI checkout
+// ("D:/a/.../vendor/dolphin"). Prefer a `share/dolphin` directory beside the
+// executable, which the packaging step populates, and fall back to the
+// configured source tree for in-tree builds.
+fs::path VendorDolphinRoot(const char* argv0)
+{
+  std::error_code ec;
+  const fs::path self = fs::weakly_canonical(argv0, ec);
+  const fs::path exe_dir = self.parent_path();
+  // Portable package: share/ beside the executable. Installed layout (AppImage):
+  // the executables live in usr/bin, so usr/share is one level up.
+  for (const fs::path& candidate :
+       {exe_dir / "share" / "dolphin", exe_dir / ".." / "share" / "dolphin"})
+  {
+    if (fs::is_directory(candidate / "module-template", ec))
+      return fs::weakly_canonical(candidate, ec);
+  }
+  return fs::path(MODERNGEKKO_SOURCE_DIR) / "vendor" / "dolphin";
+}
+
 std::string DolRecompCodegenIdentity()
 {
   constexpr std::array<const char*, 8> names = {
@@ -576,9 +599,9 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   const auto& game = *inspected.metadata;
   if (options.output.empty())
     options.output = DefaultOutput();
-  const fs::path source_root = fs::path(MODERNGEKKO_SOURCE_DIR);
+  const fs::path source_root = VendorDolphinRoot(argv0);
   const DolPatchSet patches = LoadDefaultDolPatches(
-      source_root / "vendor/dolphin/Data/Sys/GameSettings" / (game.disc_id + ".ini"));
+      source_root / "Data/Sys/GameSettings" / (game.disc_id + ".ini"));
   if (!patches)
   {
     std::cerr << patches.error << '\n';
@@ -796,16 +819,16 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
 
   const unsigned compile_jobs = std::max(1u, std::thread::hardware_concurrency());
   std::string configure = "cmake -E env CMAKE_NINJA_FORCE_RESPONSE_FILE=1 cmake -S " +
-      Quote(source_root / "vendor/dolphin/module-template") +
+      Quote(source_root / "module-template") +
       " -B " + Quote(module_build) + " -G Ninja -DCMAKE_BUILD_TYPE=Release" +
       " -DCMAKE_C_COMPILER=" + compiler + " -DGAME_ID=" + game.disc_id +
       " -DGENERATED_DIR=" + Quote(generated) +
-      " -DGXRUNTIME_DIR=" + Quote(source_root / "vendor/dolphin/GXRuntime") +
+      " -DGXRUNTIME_DIR=" + Quote(source_root / "GXRuntime") +
       (options.opt_level.empty()
            ? std::string()
            : " -DRECOMPCORE_MODULE_OPT_LEVEL=" + options.opt_level) +
       " -DCHASSIS_ABI_DIR=" +
-      Quote(source_root / "vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp");
+      Quote(source_root / "Source/Core/Core/PowerPC/StaticRecomp");
   if (!pgo_compile_flags.empty())
     configure += " -DCMAKE_C_FLAGS=" + QuoteText(pgo_compile_flags) +
                  " -DCMAKE_SHARED_LINKER_FLAGS=" + QuoteText(pgo_compile_flags);
