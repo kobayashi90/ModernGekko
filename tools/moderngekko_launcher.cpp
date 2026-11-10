@@ -634,7 +634,8 @@ fs::path SiblingTool(const char* argv0, const char* name)
 bool UseBundledToolchain(const fs::path& install_dir)
 {
   std::vector<fs::path> dirs;
-  for (const char* relative : {"Toolchain/bin", "Toolchain/mingw/bin", "Toolchain/cmake/bin"})
+  for (const char* relative :
+       {"Toolchain/bin", "Toolchain/mingw/bin", "Toolchain/cmake/bin", "Toolchain/python"})
   {
     std::error_code ec;
     const fs::path dir = install_dir / relative;
