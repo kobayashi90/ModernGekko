@@ -26,9 +26,10 @@
 #include <thread>
 #include <vector>
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <cerrno>
 #include <unistd.h>
+#include <sys/wait.h>
 #endif
 
 #if defined(_WIN32)
