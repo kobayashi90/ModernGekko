@@ -11,6 +11,7 @@
 #include "Core/Config/CheatSettings.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/HW/GCPad.h"
 #include "VideoCommon/VideoConfig.h"
 
 #include <charconv>
@@ -542,6 +543,27 @@ int RunMain(int argc, char **argv) {
     hooks.allow_ogl =
         config.window_system != moderngekko::WindowSystem::Wayland;
     config_menu.Start(std::move(hooks));
+  }
+
+  // The launcher can record "keyboard as pad" but cannot generate the binding
+  // block: only this process owns Dolphin's controller interface, and the
+  // provider is installed by ConfigMenu::Start above. Refresh the profile here
+  // and reload it so the pad sees the new device list.
+  if (!frontend_config.controllers.empty() &&
+      frontend_config.controllers.front().starts_with("Keyboard"))
+  {
+    std::string controller_error;
+    if (moderngekko::frontend::GenerateControllerConfig(user_directory,
+                                                        frontend_config.controllers,
+                                                        &controller_error))
+    {
+      if (Pad::IsInitialized())
+        Pad::LoadConfig();
+    }
+    else
+    {
+      std::cerr << "[run] keyboard controller setup failed: " << controller_error << '\n';
+    }
   }
 
   std::signal(SIGINT, HandleStopSignal);

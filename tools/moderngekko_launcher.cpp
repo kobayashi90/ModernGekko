@@ -7,9 +7,6 @@
 #include "DiscIO/DiscExtractor.h"
 #include "DiscIO/Filesystem.h"
 #include "DiscIO/Volume.h"
-#include "Common/Config/Config.h"
-#include "Common/WindowSystemInfo.h"
-#include "InputCommon/ControllerInterface/ControllerInterface.h"
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -118,167 +115,6 @@ std::string RequiredGameError(const moderngekko::GameMetadata& metadata)
   return {};
 }
 
-// --- keyboard-as-pad -------------------------------------------------------
-// This build has no gamepad requirement: the first-run card must also work on a
-// machine with nothing plugged in. Dolphin's evdev/XInput2 backends already
-// expose real keyboards through ControllerInterface, so a "Keyboard" entry is
-// just a controller whose bindings are generated from the keyboard device.
-// The runtime side (the F1 menu) does the same; these helpers are duplicated
-// here because the launcher deliberately does not link the menu.
-
-std::string UpperCopy(std::string value)
-{
-  std::ranges::transform(value, value.begin(), [](unsigned char c)
-                         { return static_cast<char>(std::toupper(c)); });
-  return value;
-}
-
-std::string LowerCopy(std::string value)
-{
-  std::ranges::transform(value, value.begin(), [](unsigned char c)
-                         { return static_cast<char>(std::tolower(c)); });
-  return value;
-}
-
-// A device exposing SPACE/RETURN/UP is a keyboard; SDL gamepads never do.
-bool InputLooksLikeKeyboard(const ciface::Core::Device& device)
-{
-  bool space = false;
-  bool ret = false;
-  bool up = false;
-  for (const auto* input : device.Inputs())
-  {
-    const std::string name = UpperCopy(input->GetName());
-    if (name == "SPACE")
-      space = true;
-    else if (name == "RETURN" || name == "ENTER")
-      ret = true;
-    else if (name == "UP")
-      up = true;
-  }
-  return space && ret && up;
-}
-
-// Empty in-memory config layer. The launcher has no INI-backed config layers
-// of its own (it writes its own config.ini), but Dolphin's input backends do
-// Config::SetBase in their constructors, and SetBase without a Base layer
-// crashes.
-class EmptyConfigLayerLoader final : public Config::ConfigLayerLoader
-{
-public:
-  explicit EmptyConfigLayerLoader(Config::LayerType layer) : Config::ConfigLayerLoader(layer) {}
-  void Load(Config::Layer*) override {}
-  void Save(Config::Layer*) override {}
-};
-
-// The launcher is a separate process and never initialises the controller
-// interface itself (the runtime does that after hand-off). Without this the
-// device list is empty and the keyboard option would never be offered.
-void EnsureControllerInterface()
-{
-  static bool config_ready = false;
-  if (!config_ready)
-  {
-    // The SDL input backend writes a Config key in its constructor. In the
-    // runtime the core has already initialised the config layers by then; the
-    // launcher has not, and an empty layer map makes that Config::Set crash.
-    Config::Init();
-    if (!Config::GetLayer(Config::LayerType::Base))
-      Config::AddLayer(std::make_unique<EmptyConfigLayerLoader>(Config::LayerType::Base));
-    config_ready = true;
-  }
-  if (g_controller_interface.IsInit())
-    return;
-  // Headless is enough: evdev/SDL enumeration does not need a render surface,
-  // and a render surface is not available this early either.
-  g_controller_interface.Initialize(WindowSystemInfo{});
-}
-
-std::shared_ptr<ciface::Core::Device> FindKeyboardDevice(const std::string& override_name)
-{
-  EnsureControllerInterface();
-  std::shared_ptr<ciface::Core::Device> fallback;
-  for (auto& device : g_controller_interface.GetAllDevices())
-  {
-    if (!device || device->Inputs().empty() || !InputLooksLikeKeyboard(*device))
-      continue;
-    if (!override_name.empty())
-    {
-      if (device->GetQualifiedName() == override_name || device->GetName() == override_name)
-        return device;
-      continue;
-    }
-    if (LowerCopy(device->GetName()).find("keyboard") != std::string::npos)
-      return device;
-    if (!fallback)
-      fallback = device;
-  }
-  return override_name.empty() ? fallback : nullptr;
-}
-
-std::string ProvideKeyboardPadBindings(std::string_view spec)
-{
-  std::string override_name;
-  if (spec.starts_with("Keyboard|"))
-    override_name = std::string(spec.substr(std::string("Keyboard|").size()));
-  const auto device = FindKeyboardDevice(override_name);
-  if (!device)
-    return {};
-
-  std::map<std::string, std::string> inputs;
-  for (const auto* input : device->Inputs())
-    inputs.emplace(UpperCopy(input->GetName()), input->GetName());
-
-  static const std::vector<std::pair<const char*, std::vector<const char*>>> layout = {
-      {"Buttons/A", {"SPACE"}},
-      {"Buttons/B", {"LEFTSHIFT", "SHIFT_L"}},
-      {"Buttons/X", {"Z"}},
-      {"Buttons/Y", {"C"}},
-      {"Buttons/Z", {"X"}},
-      {"Buttons/Start", {"RETURN", "ENTER"}},
-      {"Main Stick/Up", {"UP"}},
-      {"Main Stick/Down", {"DOWN"}},
-      {"Main Stick/Left", {"LEFT"}},
-      {"Main Stick/Right", {"RIGHT"}},
-      {"C-Stick/Up", {"W"}},
-      {"C-Stick/Down", {"S"}},
-      {"C-Stick/Left", {"A"}},
-      {"C-Stick/Right", {"D"}},
-      {"Triggers/L", {"Q"}},
-      {"Triggers/R", {"E"}},
-      {"Triggers/L-Analog", {"Q"}},
-      {"Triggers/R-Analog", {"E"}},
-      {"D-Pad/Up", {"I"}},
-      {"D-Pad/Down", {"J"}},
-      {"D-Pad/Left", {"K"}},
-      {"D-Pad/Right", {"L"}},
-  };
-
-  std::string out = "Device = " + device->GetQualifiedName() + "\n";
-  for (const auto& [control, keys] : layout)
-  {
-    for (const char* key : keys)
-    {
-      if (const auto it = inputs.find(key); it != inputs.end())
-      {
-        out += control;
-        out += " = `";
-        out += it->second;
-        out += "`\n";
-        break;
-      }
-    }
-  }
-  out += "Main Stick/Calibration = 100.00\n";
-  out += "C-Stick/Calibration = 100.00\n";
-  return out;
-}
-
-bool KeyboardAvailable()
-{
-  return FindKeyboardDevice(std::string{}) != nullptr;
-}
-
 std::vector<ControllerOption> EnumerateControllers()
 {
   std::vector<ControllerOption> result;
@@ -308,9 +144,10 @@ std::vector<ControllerOption> EnumerateControllers()
   if (joystick_ids)
     SDL_free(joystick_ids);
   // Keyboard is always offered last, so a real gamepad still wins the default
-  // selection when one is plugged in. The bare "Keyboard" spec is the
-  // auto-detect form that GenerateControllerConfig resolves at apply time.
-  if (KeyboardAvailable())
+  // selection when one is plugged in. The bare "Keyboard" spec is resolved by
+  // the runner, which owns the controller interface: enumerating keyboards here
+  // means initialising Dolphin's input stack in the launcher, and that turned
+  // into an unstable (sometimes crashing) startup.
   {
     ControllerOption keyboard;
     keyboard.label = "Keyboard (keyboard as pad)";
@@ -944,14 +781,8 @@ int main(int argc, char** argv)
   int selected_savestate = -1;
 
   DialogState dialog;
-  // Must be installed before any controller profile is generated, or a
-  // "Keyboard" selection fails with "keyboard input is not available".
-  moderngekko::frontend::SetKeyboardPadBindingsProvider(&ProvideKeyboardPadBindings);
   std::vector<ControllerOption> controllers = EnumerateControllers();
-  // One-line inventory so a "no controller" report can be diagnosed from the
-  // log instead of guessing whether the keyboard path was available at all.
-  std::fprintf(stderr, "[launcher] controllers=%zu keyboard=%d\n", controllers.size(),
-               KeyboardAvailable() ? 1 : 0);
+  std::fprintf(stderr, "[launcher] controllers=%zu\n", controllers.size());
   bool controller_profile_exists = moderngekko::frontend::ControllerConfigExists(user_directory);
   std::vector<std::string> configured_controllers =
       moderngekko::frontend::ReadConfiguredControllers(user_directory);
@@ -962,13 +793,19 @@ int main(int argc, char** argv)
   const auto select_controller = [&](int index)
   {
     std::string message;
-    if (!moderngekko::frontend::GenerateControllerConfig(user_directory, controllers[index].device,
-                                                         &message))
+    // Keyboard devices are resolved by the runner, which is the process that
+    // owns Dolphin's controller interface. The launcher only records the
+    // choice; moderngekko-run regenerates GCPadNew.ini from it at startup.
+    if (!controllers[index].device.starts_with("Keyboard") &&
+        !moderngekko::frontend::GenerateControllerConfig(user_directory,
+                                                         controllers[index].device, &message))
     {
       std::lock_guard lock(dialog.mutex);
       dialog.error = std::move(message);
       return false;
     }
+    if (controllers[index].device.starts_with("Keyboard"))
+      message = "Keyboard bindings are written when the game starts";
     std::string error;
     if (!moderngekko::frontend::SaveConfig(user_directory, resolutions[resolution_index].text,
                                            show_fps_in_title, controllers[index].device, &error))
@@ -1008,7 +845,7 @@ int main(int argc, char** argv)
     if (controller_index < 0)
     {
       std::lock_guard lock(dialog.mutex);
-      dialog.error = "Connect a controller or enable keyboard input before playing";
+      dialog.error = "Connect a controller or pick the keyboard option before playing";
       return false;
     }
     return select_controller(controller_index);
@@ -1603,6 +1440,44 @@ int main(int argc, char** argv)
     extraction_thread.join();
 
   int result = 0;
+  // A build with no recompiled module cannot run a disc. Check before launching
+  // so the reason is shown as a dialog instead of surfacing later as the
+  // runtime's internal "no native module was supplied" message, which reads as
+  // a broken build to anyone who has not seen it before.
+  if (launch_mode != LaunchMode::None && current_metadata)
+  {
+    std::string suffix = ".so";
+#if defined(_WIN32)
+    suffix = ".dll";
+#elif defined(__APPLE__)
+    suffix = ".dylib";
+#endif
+    const std::string module_name =
+        "g" + current_metadata.metadata->disc_id + "_recomp" + suffix;
+    std::error_code ec;
+    const fs::path exe_dir = SiblingRunner(argv[0]).parent_path();
+    const fs::path modules_dir = user_directory / "StaticRecompModules";
+    if (!fs::is_regular_file(exe_dir / module_name, ec) &&
+        !fs::is_regular_file(modules_dir / module_name, ec))
+    {
+      const std::string message =
+          "This build ships without a recompiled game module, so it cannot run a disc on "
+          "its own.\n\n"
+          "The module (" + module_name +
+          ") is generated from your own disc image and is not redistributable, which is "
+          "why it is not inside this package.\n\n"
+          "Supply it in one of these ways:\n"
+          "  - copy " + module_name + " next to the executable, or into:\n    " +
+          modules_dir.string() +
+          "\n  - or build it locally from your dump with:\n    make recompile ISO=<your dump>\n\n"
+          "See README.md, \"Recompile and Run\".";
+      SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "No recompiled module", message.c_str(),
+                               window);
+      launch_mode = LaunchMode::None;
+      result = 1;
+    }
+  }
+
   if (launch_mode != LaunchMode::None)
   {
     std::string launch_error;
@@ -1761,13 +1636,6 @@ int main(int argc, char** argv)
       }
     }
   }
-
-  // The controller interface is only initialised here to enumerate keyboards.
-  // Its backends spawn hotplug threads, and leaving them alive makes process
-  // exit block (SIGTERM turned into a quit that never completed, so the
-  // first-run harness hung). Shut it down explicitly before tearing down SDL.
-  if (g_controller_interface.IsInit())
-    g_controller_interface.Shutdown();
 
   ImGui_ImplSDLRenderer3_Shutdown();
   ImGui_ImplSDL3_Shutdown();

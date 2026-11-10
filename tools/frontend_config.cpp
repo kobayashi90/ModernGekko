@@ -663,6 +663,16 @@ bool EnsureControllerConfig(const fs::path &user_directory,
       *message = "using existing controller profile";
     return true;
   }
+  // A keyboard profile can only be rendered by the process that owns the
+  // controller interface, and the provider is installed during core startup --
+  // after this call. Treat it as deferred instead of failing the launch.
+  const bool keyboard_selected = std::ranges::any_of(
+      controllers, [](const std::string &value) { return value.starts_with("Keyboard"); });
+  if (keyboard_selected) {
+    if (message)
+      *message = "keyboard bindings will be generated at launch";
+    return true;
+  }
   return GenerateControllerConfig(user_directory, controllers, message);
 }
 
