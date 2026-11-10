@@ -1043,6 +1043,25 @@ int main(int argc, char** argv)
     Join,
   };
   bool done = false;
+  // The module gate lives in the launcher window instead of an SDL dialog: a
+  // failed SDL_ShowMessageBox used to leave the process exiting silently right
+  // after the "build it now" prompt, which looked like the app just closing.
+  enum class ModuleGate
+  {
+    None,
+    Ask,
+    Building,
+    Failed,
+  };
+  ModuleGate gate = ModuleGate::None;
+  bool auto_launch_done = false;
+  bool auto_build_done = false;
+  LaunchMode pending_launch = LaunchMode::None;
+  std::atomic<bool> build_done{false};
+  std::atomic<bool> build_ok{false};
+  std::string build_error;
+  std::chrono::steady_clock::time_point build_start{};
+  std::jthread build_thread;
   bool first_run_card = false;
   // Counts the frames the setup card has been drawn for, so its item rects are
   // logged once (a per-frame log would be thousands of identical lines).
@@ -1070,6 +1089,55 @@ int main(int argc, char** argv)
       SDL_Log("SDL_SaveBMP(%s) failed: %s", path.c_str(), SDL_GetError());
     SDL_DestroySurface(frame);
   };
+  // Sibling tool + where a built module goes. `share/dolphin` beside the tool
+  // tree is populated by packaging; without it the port falls back to the path
+  // it was built in, which only exists on the machine that built the release.
+  const fs::path exe_dir = SiblingRunner(argv[0]).parent_path();
+  const fs::path port_tool = SiblingTool(argv[0], "moderngekko-port");
+  const fs::path modules_dir = user_directory / "StaticRecompModules";
+
+  auto module_suffix = []()
+  {
+#if defined(_WIN32)
+    return std::string(".dll");
+#elif defined(__APPLE__)
+    return std::string(".dylib");
+#else
+    return std::string(".so");
+#endif
+  };
+
+  const auto module_name_for_disc = [&]() -> std::string
+  {
+    if (!current_metadata)
+      return {};
+    return "g" + current_metadata.metadata->disc_id + "_recomp" + module_suffix();
+  };
+
+  const auto module_present = [&]()
+  {
+    const std::string name = module_name_for_disc();
+    if (name.empty())
+      return false;
+    std::error_code ec;
+    return fs::is_regular_file(exe_dir / name, ec) ||
+           fs::is_regular_file(modules_dir / name, ec);
+  };
+
+  const auto request_launch = [&](LaunchMode mode)
+  {
+    if (!ensure_controller())
+      return;
+    if (module_present())
+    {
+      launch_mode = mode;
+      done = true;
+      return;
+    }
+    pending_launch = mode;
+    gate = ModuleGate::Ask;
+  };
+
   while (!done)
   {
     bool controllers_changed = false;
@@ -1105,12 +1173,18 @@ int main(int argc, char** argv)
         if (current_metadata && !RequiredGameError(*current_metadata.metadata).empty())
           current_metadata = {{}, RequiredGameError(*current_metadata.metadata)};
         extraction.finished_game.reset();
-        if (ensure_controller())
-        {
-          launch_mode = LaunchMode::Solo;
-          done = true;
-        }
+        request_launch(LaunchMode::Solo);
       }
+    }
+
+    // Test hook: start the normal launch path without a mouse, so the module
+    // gate can be exercised from a script. MODERNGEKKO_LAUNCHER_AUTOBUILD also
+    // presses "Build it now".
+    if (!auto_launch_done && !current_game.empty() &&
+        SDL_getenv("MODERNGEKKO_LAUNCHER_AUTOPLAY") != nullptr)
+    {
+      auto_launch_done = true;
+      request_launch(LaunchMode::Solo);
     }
 
     ImGui_ImplSDLRenderer3_NewFrame();
@@ -1164,13 +1238,7 @@ int main(int argc, char** argv)
         ImGui::Spacing();
       }
       if (ImGui::Button("Play", ImVec2(180 * scale, 42 * scale)))
-      {
-        if (ensure_controller())
-        {
-          launch_mode = LaunchMode::Solo;
-          done = true;
-        }
-      }
+        request_launch(LaunchMode::Solo);
       ImGui::SameLine();
       if (ImGui::Button("Host Netplay", ImVec2(180 * scale, 42 * scale)))
       {
@@ -1189,8 +1257,7 @@ int main(int argc, char** argv)
           std::string error;
           if (moderngekko::frontend::SaveConfig(user_directory, config, &error))
           {
-            launch_mode = LaunchMode::Host;
-            done = true;
+            request_launch(LaunchMode::Host);
           }
           else
           {
@@ -1217,8 +1284,7 @@ int main(int argc, char** argv)
           std::string error;
           if (moderngekko::frontend::SaveConfig(user_directory, config, &error))
           {
-            launch_mode = LaunchMode::Join;
-            done = true;
+            request_launch(LaunchMode::Join);
           }
           else
           {
@@ -1568,6 +1634,152 @@ int main(int argc, char** argv)
       }
     }
 
+    // --- module gate -------------------------------------------------------
+    // Drawn last so it sits over the launcher window. Keeping this in-window
+    // (rather than an SDL message box) is deliberate: the box could fail to
+    // appear and the process then exited silently, which read as "the app just
+    // closes" right after the prompt.
+    if (gate == ModuleGate::Building && build_done.load())
+    {
+      if (build_ok.load())
+      {
+        launch_mode = pending_launch;
+        gate = ModuleGate::None;
+        done = true;
+      }
+      else
+      {
+        gate = ModuleGate::Failed;
+      }
+    }
+    if (gate != ModuleGate::None)
+    {
+      const std::string module_name = module_name_for_disc();
+      const ImGuiViewport* gate_viewport = ImGui::GetMainViewport();
+      // Dim the launcher behind the gate: without it the settings text shows
+      // through and the dialog reads as overlapping layers.
+      ImGui::GetBackgroundDrawList()->AddRectFilled(
+          gate_viewport->Pos,
+          ImVec2(gate_viewport->Pos.x + gate_viewport->Size.x,
+                 gate_viewport->Pos.y + gate_viewport->Size.y),
+          IM_COL32(0, 0, 0, 150));
+      ImGui::SetNextWindowBgAlpha(1.0f);
+      ImGui::SetNextWindowPos(
+          ImVec2(gate_viewport->GetCenter().x, gate_viewport->GetCenter().y),
+          ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+      ImGui::SetNextWindowSize(ImVec2(680 * scale, 0), ImGuiCond_Always);
+      ImGui::Begin("Recompiled game module", nullptr,
+                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+      switch (gate)
+      {
+      case ModuleGate::Ask:
+      {
+        if (!auto_build_done && SDL_getenv("MODERNGEKKO_LAUNCHER_AUTOBUILD") != nullptr &&
+            !port_tool.empty())
+        {
+          auto_build_done = true;
+          gate = ModuleGate::Building;
+          build_done.store(false);
+          build_ok.store(false);
+          build_error.clear();
+          build_start = std::chrono::steady_clock::now();
+          const fs::path output = modules_dir / module_name;
+          const fs::path work_dir = modules_dir / "build";
+          const fs::path log_path = user_directory / "Logs" / "module-build.log";
+          const bool bundled = UseBundledToolchain(exe_dir);
+          LauncherLog("module build started: %s", output.string().c_str());
+          build_thread = std::jthread(
+              [&, output, work_dir, log_path, bundled]
+              {
+                std::string error;
+                const bool ok = BuildModuleFromDisc(port_tool, current_game, work_dir, output,
+                                                    log_path, bundled, &error);
+                build_error = std::move(error);
+                build_ok.store(ok);
+                build_done.store(true);
+              });
+          break;
+        }
+        ImGui::TextWrapped(
+            "This package ships no compiled game module. The module is generated from your "
+            "own disc and cannot be redistributed, so it is built here instead.");
+        ImGui::Spacing();
+        ImGui::TextWrapped("Build %s now? This compiles the game's code and takes several "
+                           "minutes.",
+                           module_name.c_str());
+        ImGui::Spacing();
+        if (port_tool.empty())
+        {
+          ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                             "moderngekko-port is missing from this install, so it cannot be "
+                             "built here.");
+          if (ImGui::Button("Close"))
+            gate = ModuleGate::None;
+        }
+        else
+        {
+          if (ImGui::Button("Build it now", ImVec2(180 * scale, 36 * scale)))
+          {
+            gate = ModuleGate::Building;
+            build_done.store(false);
+            build_ok.store(false);
+            build_error.clear();
+            build_start = std::chrono::steady_clock::now();
+            const fs::path output = modules_dir / module_name;
+            const fs::path work_dir = modules_dir / "build";
+            const fs::path log_path = user_directory / "Logs" / "module-build.log";
+            const bool bundled = UseBundledToolchain(exe_dir);
+            LauncherLog("module build started: %s", output.string().c_str());
+            build_thread = std::jthread(
+                [&, output, work_dir, log_path, bundled]
+                {
+                  std::string error;
+                  const bool ok = BuildModuleFromDisc(port_tool, current_game, work_dir, output,
+                                                      log_path, bundled, &error);
+                  build_error = std::move(error);
+                  build_ok.store(ok);
+                  build_done.store(true);
+                });
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Cancel", ImVec2(120 * scale, 36 * scale)))
+            gate = ModuleGate::None;
+          ImGui::Spacing();
+          ImGui::TextDisabled("Needs a compiler: bundled for Windows, gcc/clang elsewhere.");
+        }
+        break;
+      }
+      case ModuleGate::Building:
+      {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - build_start);
+        ImGui::Text("Building %s ... %llds", module_name.c_str(),
+                    static_cast<long long>(elapsed.count()));
+        ImGui::Spacing();
+        ImGui::TextWrapped("The window stays up until the build finishes. Full output: %s",
+                           (user_directory / "Logs" / "module-build.log").string().c_str());
+        break;
+      }
+      case ModuleGate::Failed:
+      {
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "The module build failed.");
+        ImGui::Spacing();
+        if (!build_error.empty())
+          ImGui::TextWrapped("%s", build_error.c_str());
+        ImGui::Spacing();
+        if (ImGui::Button("Try again", ImVec2(140 * scale, 36 * scale)))
+          gate = ModuleGate::Ask;
+        ImGui::SameLine();
+        if (ImGui::Button("Close", ImVec2(120 * scale, 36 * scale)))
+          gate = ModuleGate::None;
+        break;
+      }
+      case ModuleGate::None:
+        break;
+      }
+      ImGui::End();
+    }
+
     ImGui::Render();
     SDL_SetRenderScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
     SDL_SetRenderDrawColor(renderer, 18, 20, 28, 255);
@@ -1582,92 +1794,8 @@ int main(int argc, char** argv)
     extraction_thread.join();
 
   int result = 0;
-  // A build with no recompiled module cannot run a disc. Offer to compile it
-  // from the player's own extraction with the bundled port tool: the module is
-  // derived from the game, so it is generated locally rather than shipped.
-  if (launch_mode != LaunchMode::None && current_metadata)
-  {
-    std::string suffix = ".so";
-#if defined(_WIN32)
-    suffix = ".dll";
-#elif defined(__APPLE__)
-    suffix = ".dylib";
-#endif
-    const std::string module_name =
-        "g" + current_metadata.metadata->disc_id + "_recomp" + suffix;
-    std::error_code ec;
-    const fs::path exe_dir = SiblingRunner(argv[0]).parent_path();
-    const fs::path modules_dir = user_directory / "StaticRecompModules";
-    if (!fs::is_regular_file(exe_dir / module_name, ec) &&
-        !fs::is_regular_file(modules_dir / module_name, ec))
-    {
-      const fs::path port_tool = SiblingTool(argv[0], "moderngekko-port");
-      const fs::path output = modules_dir / module_name;
-      bool build_now = false;
-      if (port_tool.empty())
-      {
-        const std::string message =
-            "This package does not include a recompiled game module for " +
-            current_metadata.metadata->disc_id +
-            ", and the tool that builds one (moderngekko-port) is not beside the "
-            "executable either.\n\n"
-            "Put " + module_name +
-            " next to the executable (or into " + modules_dir.string() +
-            "), or build it from your dump with:\n    make recompile ISO=<your dump>";
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "No recompiled module", message.c_str(),
-                                 window);
-        launch_mode = LaunchMode::None;
-        result = 1;
-      }
-      else
-      {
-        const SDL_MessageBoxButtonData buttons[] = {
-            {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Build it now"},
-            {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Cancel"},
-        };
-        const SDL_MessageBoxData data = {
-            SDL_MESSAGEBOX_INFORMATION,
-            window,
-            "Recompiled module required",
-            ("This build ships no compiled game module: the module is generated from your "
-             "own disc and cannot be redistributed.\n\n"
-             "Build " + module_name +
-             " now from the disc you just extracted? This compiles the game's code and can "
-             "take a few minutes.").c_str(),
-            SDL_arraysize(buttons),
-            buttons,
-            nullptr};
-        int pressed = 0;
-        if (SDL_ShowMessageBox(&data, &pressed) == 0 && pressed == 1)
-          build_now = true;
-      }
-      if (build_now)
-      {
-        const fs::path log_path = user_directory / "Logs" / "module-build.log";
-        std::string build_error;
-        const bool bundled_toolchain = UseBundledToolchain(exe_dir);
-        std::fprintf(stderr, "[launcher] building %s from %s\n", module_name.c_str(),
-                     current_game.string().c_str());
-        if (BuildModuleFromDisc(port_tool, current_game, modules_dir / "build", output,
-                                log_path, bundled_toolchain, &build_error))
-        {
-          std::fprintf(stderr, "[launcher] module built: %s\n", output.string().c_str());
-        }
-        else
-        {
-          SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Module build failed",
-                                   build_error.c_str(), window);
-          launch_mode = LaunchMode::None;
-          result = 1;
-        }
-      }
-      else if (launch_mode != LaunchMode::None && !fs::is_regular_file(output, ec))
-      {
-        launch_mode = LaunchMode::None;
-        result = 1;
-      }
-    }
-  }
+  if (build_thread.joinable())
+    build_thread.join();
 
   if (launch_mode != LaunchMode::None)
   {
