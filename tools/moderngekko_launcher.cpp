@@ -609,6 +609,99 @@ void ShowDiscImageDialog(SDL_Window* window, DialogState* dialog)
                          static_cast<int>(std::size(filters)), documents.c_str(), false);
 }
 
+fs::path SiblingTool(const char* argv0, const char* name)
+{
+  std::error_code ec;
+  const fs::path self = fs::weakly_canonical(argv0, ec);
+  fs::path tool = name;
+#if defined(_WIN32)
+  tool += ".exe";
+#endif
+  const fs::path sibling = self.parent_path() / tool;
+  return fs::is_regular_file(sibling, ec) ? sibling : fs::path{};
+}
+
+// Compile the game module from the extracted disc with the bundled port tool.
+//
+// This is what makes a toolchain-only package usable: the module is generated
+// from the player's own dump, so nothing derived from the game has to be
+// redistributed. Returns false and fills *error when the tool is missing or the
+// build reports failure; the full compiler output goes to log_path.
+bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
+                         const fs::path& work_dir, const fs::path& final_path,
+                         const fs::path& log_path, std::string* error)
+{
+  std::error_code ec;
+  fs::create_directories(work_dir, ec);
+  fs::create_directories(final_path.parent_path(), ec);
+  fs::create_directories(log_path.parent_path(), ec);
+  SDL_IOStream* log = SDL_IOFromFile(log_path.string().c_str(), "w");
+  if (!log)
+  {
+    *error = "cannot open " + log_path.string() + ": " + SDL_GetError();
+    return false;
+  }
+  // --output is the artifact *directory*: the tool puts the library under
+  // <dir>/<disc>/<dol-hash>/, so it is moved into place afterwards.
+  const std::array<std::string, 5> storage = {port_tool.string(), "build",
+                                              game_root.string(), "--output",
+                                              work_dir.string()};
+  std::array<const char*, 6> arguments{};
+  for (std::size_t i = 0; i < storage.size(); ++i)
+    arguments[i] = storage[i].c_str();
+  const SDL_PropertiesID properties = SDL_CreateProperties();
+  SDL_SetPointerProperty(properties, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, arguments.data());
+  SDL_SetNumberProperty(properties, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER, SDL_PROCESS_STDIO_REDIRECT);
+  SDL_SetPointerProperty(properties, SDL_PROP_PROCESS_CREATE_STDOUT_POINTER, log);
+  SDL_SetBooleanProperty(properties, SDL_PROP_PROCESS_CREATE_STDERR_TO_STDOUT_BOOLEAN, true);
+  SDL_Process* process = SDL_CreateProcessWithProperties(properties);
+  SDL_DestroyProperties(properties);
+  SDL_CloseIO(log);
+  if (!process)
+  {
+    *error = std::string("cannot start ") + port_tool.string() + ": " + SDL_GetError();
+    return false;
+  }
+  int exit_code = 1;
+  const bool waited = SDL_WaitProcess(process, true, &exit_code);
+  SDL_DestroyProcess(process);
+  if (!waited || exit_code != 0)
+  {
+    *error = "the module build failed; see " + log_path.string();
+    return false;
+  }
+
+  // Pick the freshest library with the expected name under the work directory.
+  const std::string wanted = final_path.filename().string();
+  fs::path newest;
+  fs::file_time_type newest_time{};
+  for (fs::recursive_directory_iterator it(work_dir, ec), end; it != end && !ec; it.increment(ec))
+  {
+    if (!it->is_regular_file(ec) || it->path().filename() != wanted)
+      continue;
+    const auto stamp = it->last_write_time(ec);
+    if (newest.empty() || stamp > newest_time)
+    {
+      newest = it->path();
+      newest_time = stamp;
+    }
+  }
+  if (newest.empty())
+  {
+    *error = "the build finished but produced no " + wanted + "; see " + log_path.string();
+    return false;
+  }
+
+  fs::remove(final_path, ec);
+  fs::copy_file(newest, final_path, fs::copy_options::overwrite_existing, ec);
+  if (ec || !fs::is_regular_file(final_path, ec))
+  {
+    *error = "cannot copy the built module to " + final_path.string() + ": " + ec.message();
+    return false;
+  }
+  return true;
+}
+
 fs::path SiblingRunner(const char* argv0)
 {
   std::error_code ec;
@@ -1440,10 +1533,9 @@ int main(int argc, char** argv)
     extraction_thread.join();
 
   int result = 0;
-  // A build with no recompiled module cannot run a disc. Check before launching
-  // so the reason is shown as a dialog instead of surfacing later as the
-  // runtime's internal "no native module was supplied" message, which reads as
-  // a broken build to anyone who has not seen it before.
+  // A build with no recompiled module cannot run a disc. Offer to compile it
+  // from the player's own extraction with the bundled port tool: the module is
+  // derived from the game, so it is generated locally rather than shipped.
   if (launch_mode != LaunchMode::None && current_metadata)
   {
     std::string suffix = ".so";
@@ -1460,21 +1552,70 @@ int main(int argc, char** argv)
     if (!fs::is_regular_file(exe_dir / module_name, ec) &&
         !fs::is_regular_file(modules_dir / module_name, ec))
     {
-      const std::string message =
-          "This build ships without a recompiled game module, so it cannot run a disc on "
-          "its own.\n\n"
-          "The module (" + module_name +
-          ") is generated from your own disc image and is not redistributable, which is "
-          "why it is not inside this package.\n\n"
-          "Supply it in one of these ways:\n"
-          "  - copy " + module_name + " next to the executable, or into:\n    " +
-          modules_dir.string() +
-          "\n  - or build it locally from your dump with:\n    make recompile ISO=<your dump>\n\n"
-          "See README.md, \"Recompile and Run\".";
-      SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "No recompiled module", message.c_str(),
-                               window);
-      launch_mode = LaunchMode::None;
-      result = 1;
+      const fs::path port_tool = SiblingTool(argv[0], "moderngekko-port");
+      const fs::path output = modules_dir / module_name;
+      bool build_now = false;
+      if (port_tool.empty())
+      {
+        const std::string message =
+            "This package does not include a recompiled game module for " +
+            current_metadata.metadata->disc_id +
+            ", and the tool that builds one (moderngekko-port) is not beside the "
+            "executable either.\n\n"
+            "Put " + module_name +
+            " next to the executable (or into " + modules_dir.string() +
+            "), or build it from your dump with:\n    make recompile ISO=<your dump>";
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "No recompiled module", message.c_str(),
+                                 window);
+        launch_mode = LaunchMode::None;
+        result = 1;
+      }
+      else
+      {
+        const SDL_MessageBoxButtonData buttons[] = {
+            {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Build it now"},
+            {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Cancel"},
+        };
+        const SDL_MessageBoxData data = {
+            SDL_MESSAGEBOX_INFORMATION,
+            window,
+            "Recompiled module required",
+            ("This build ships no compiled game module: the module is generated from your "
+             "own disc and cannot be redistributed.\n\n"
+             "Build " + module_name +
+             " now from the disc you just extracted? This compiles the game's code and can "
+             "take a few minutes.").c_str(),
+            SDL_arraysize(buttons),
+            buttons,
+            nullptr};
+        int pressed = 0;
+        if (SDL_ShowMessageBox(&data, &pressed) == 0 && pressed == 1)
+          build_now = true;
+      }
+      if (build_now)
+      {
+        const fs::path log_path = user_directory / "Logs" / "module-build.log";
+        std::string build_error;
+        std::fprintf(stderr, "[launcher] building %s from %s\n", module_name.c_str(),
+                     current_game.string().c_str());
+        if (BuildModuleFromDisc(port_tool, current_game, modules_dir / "build", output,
+                                log_path, &build_error))
+        {
+          std::fprintf(stderr, "[launcher] module built: %s\n", output.string().c_str());
+        }
+        else
+        {
+          SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Module build failed",
+                                   build_error.c_str(), window);
+          launch_mode = LaunchMode::None;
+          result = 1;
+        }
+      }
+      else if (launch_mode != LaunchMode::None && !fs::is_regular_file(output, ec))
+      {
+        launch_mode = LaunchMode::None;
+        result = 1;
+      }
     }
   }
 
