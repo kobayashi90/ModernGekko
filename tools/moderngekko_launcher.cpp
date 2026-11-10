@@ -627,9 +627,51 @@ fs::path SiblingTool(const char* argv0, const char* name)
 // from the player's own dump, so nothing derived from the game has to be
 // redistributed. Returns false and fills *error when the tool is missing or the
 // build reports failure; the full compiler output goes to log_path.
+// A package may ship its own compiler/cmake/ninja for players who have no
+// development tools installed. Put those directories first on PATH so the port
+// tool (which shells out to `cmake` and the compiler by name) finds them, and
+// the system toolchain still wins only if nothing was bundled.
+bool UseBundledToolchain(const fs::path& install_dir)
+{
+  std::vector<fs::path> dirs;
+  for (const char* relative : {"Toolchain/bin", "Toolchain/mingw/bin", "Toolchain/cmake/bin"})
+  {
+    std::error_code ec;
+    const fs::path dir = install_dir / relative;
+    if (fs::is_directory(dir, ec))
+      dirs.push_back(dir);
+  }
+  if (dirs.empty())
+    return false;
+
+#if defined(_WIN32)
+  constexpr char separator = ';';
+  const char* const variable = "PATH";
+#else
+  constexpr char separator = ':';
+  const char* const variable = "PATH";
+#endif
+  std::string prefix;
+  for (const auto& dir : dirs)
+  {
+    prefix += dir.string();
+    prefix += separator;
+  }
+  const char* const existing = std::getenv(variable);
+  const std::string combined = prefix + (existing ? existing : "");
+#if defined(_WIN32)
+  _putenv_s(variable, combined.c_str());
+#else
+  setenv(variable, combined.c_str(), 1);
+#endif
+  std::fprintf(stderr, "[launcher] using bundled toolchain: %s\n", prefix.c_str());
+  return true;
+}
+
 bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
                          const fs::path& work_dir, const fs::path& final_path,
-                         const fs::path& log_path, std::string* error)
+                         const fs::path& log_path, bool bundled_toolchain,
+                         std::string* error)
 {
   std::error_code ec;
   fs::create_directories(work_dir, ec);
@@ -643,10 +685,16 @@ bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
   }
   // --output is the artifact *directory*: the tool puts the library under
   // <dir>/<disc>/<dol-hash>/, so it is moved into place afterwards.
-  const std::array<std::string, 5> storage = {port_tool.string(), "build",
-                                              game_root.string(), "--output",
-                                              work_dir.string()};
-  std::array<const char*, 6> arguments{};
+  std::vector<std::string> storage = {port_tool.string(), "build", game_root.string(),
+                                      "--output", work_dir.string()};
+  // A MSVC-built port defaults to `cl` for "auto"; when the package ships its
+  // own clang and the machine has no Visual Studio, name the compiler instead.
+  if (bundled_toolchain)
+  {
+    storage.emplace_back("--toolchain");
+    storage.emplace_back("clang");
+  }
+  std::array<const char*, 8> arguments{};
   for (std::size_t i = 0; i < storage.size(); ++i)
     arguments[i] = storage[i].c_str();
   const SDL_PropertiesID properties = SDL_CreateProperties();
@@ -1596,10 +1644,11 @@ int main(int argc, char** argv)
       {
         const fs::path log_path = user_directory / "Logs" / "module-build.log";
         std::string build_error;
+        const bool bundled_toolchain = UseBundledToolchain(exe_dir);
         std::fprintf(stderr, "[launcher] building %s from %s\n", module_name.c_str(),
                      current_game.string().c_str());
         if (BuildModuleFromDisc(port_tool, current_game, modules_dir / "build", output,
-                                log_path, &build_error))
+                                log_path, bundled_toolchain, &build_error))
         {
           std::fprintf(stderr, "[launcher] module built: %s\n", output.string().c_str());
         }
