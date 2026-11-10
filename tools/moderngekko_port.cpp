@@ -663,8 +663,9 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   if (compiler == "clang")
   {
     flags = "compile:-O" + opt +
-            " -flto=thin -fvisibility=hidden -ffp-contract=off -fno-fast-math "
-            "link:-flto=thin";
+            (options.no_lto ? "" : " -flto=thin") +
+            " -fvisibility=hidden -ffp-contract=off -fno-fast-math" +
+            (options.no_lto ? " link:no-lto" : " link:-flto=thin");
 #if defined(__linux__)
     flags += " -fuse-ld=lld";
 #endif

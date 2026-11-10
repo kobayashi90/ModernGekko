@@ -21,6 +21,10 @@ struct BuildOptions
   pgo::PgoBuildOptions pgo;
   pgo::ManifestFacts pgo_facts;
   bool make_active = true;
+  // Skip ThinLTO. The on-demand build inside the launcher uses this: the LTO
+  // link is the slowest and most fragile step, and a user building once wants
+  // a game, not the last few percent.
+  bool no_lto = false;
 };
 
 struct PgoRunOptions
@@ -84,6 +88,8 @@ inline CommandLine ParseCommandLine(int argc, const char* const* argv,
       parsed.build.opt_level = argv[++i];
     else if (argument == "--output" && i + 1 < argc)
       parsed.build.output = fs::path(argv[++i]);
+    else if (argument == "--no-lto")
+      parsed.build.no_lto = true;
     else if (argument == "--profile-dir" && i + 1 < argc && is_pgo_run)
       parsed.pgo_run.profile_dir = fs::path(argv[++i]);
     else if (argument == "--llvm-profdata" && i + 1 < argc && is_pgo_run)

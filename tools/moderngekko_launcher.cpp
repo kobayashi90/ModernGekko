@@ -686,8 +686,12 @@ bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
   }
   // --output is the artifact *directory*: the tool puts the library under
   // <dir>/<disc>/<dol-hash>/, so it is moved into place afterwards.
+  // --no-lto: an on-demand build is a one-shot for a player, and the ThinLTO
+  // link is both the slowest step (minutes) and the one that hung under Wine.
+  // Losing a few percent of peak speed is the right trade for a build that
+  // actually finishes.
   std::vector<std::string> storage = {port_tool.string(), "build", game_root.string(),
-                                      "--output", work_dir.string()};
+                                      "--output", work_dir.string(), "--no-lto"};
   // A MSVC-built port defaults to `cl` for "auto"; when the package ships its
   // own clang and the machine has no Visual Studio, name the compiler instead.
   if (bundled_toolchain)
