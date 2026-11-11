@@ -699,9 +699,15 @@ bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
     storage.emplace_back("--toolchain");
     storage.emplace_back("clang");
   }
-  std::array<const char*, 8> arguments{};
-  for (std::size_t i = 0; i < storage.size(); ++i)
-    arguments[i] = storage[i].c_str();
+  // SDL wants a NULL-terminated argv. A fixed array sized to the *longest*
+  // command line is one entry short the moment the bundled-toolchain flags are
+  // appended, and the extra slot then reads whatever follows the array on the
+  // stack -- which surfaced on Windows as "unknown or incomplete option: s".
+  std::vector<const char*> arguments;
+  arguments.reserve(storage.size() + 1);
+  for (const std::string& argument : storage)
+    arguments.push_back(argument.c_str());
+  arguments.push_back(nullptr);
   const SDL_PropertiesID properties = SDL_CreateProperties();
   SDL_SetPointerProperty(properties, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, arguments.data());
   SDL_SetNumberProperty(properties, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER, SDL_PROCESS_STDIO_REDIRECT);
