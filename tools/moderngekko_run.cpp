@@ -552,13 +552,28 @@ int RunMain(int argc, char **argv) {
   if (!frontend_config.controllers.empty() &&
       frontend_config.controllers.front().starts_with("Keyboard"))
   {
+    // The controller interface enumerates devices on its own thread, so the
+    // keyboard is not necessarily visible the instant the core is up. Generating
+    // too early failed, Pad had already loaded an empty profile, and the first
+    // launch then had no input until the second run wrote the file. Poll until
+    // the device shows up (bounded), then reload the pad config.
     std::string controller_error;
-    if (moderngekko::frontend::GenerateControllerConfig(user_directory,
-                                                        frontend_config.controllers,
-                                                        &controller_error))
+    bool controller_ready = false;
+    for (int attempt = 0; attempt < 50 && !controller_ready; ++attempt)
+    {
+      if (moderngekko::frontend::GenerateControllerConfig(
+              user_directory, frontend_config.controllers, &controller_error))
+      {
+        controller_ready = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (controller_ready)
     {
       if (Pad::IsInitialized())
         Pad::LoadConfig();
+      std::fprintf(stderr, "[run] keyboard controller profile ready\n");
     }
     else
     {

@@ -781,6 +781,71 @@ void ConfigMenu::DrawOverlayFrame() {
   Draw();
 }
 
+namespace {
+
+// A coherent dark theme for the overlay: the stock ImGui defaults are grey and
+// cramped, and this window sits on top of a game (its own colours), so it needs
+// to look deliberate rather than like a debug panel. Values are deliberately
+// few and flat -- rounded frames, a teal accent for "on" states, muted borders.
+struct MenuStyleColors
+{
+  ImGuiCol index;
+  ImVec4 color;
+};
+
+constexpr MenuStyleColors kMenuColors[] = {
+    {ImGuiCol_WindowBg, ImVec4(0.075f, 0.085f, 0.115f, 0.985f)},
+    {ImGuiCol_TitleBg, ImVec4(0.10f, 0.12f, 0.16f, 1.00f)},
+    {ImGuiCol_TitleBgActive, ImVec4(0.12f, 0.145f, 0.19f, 1.00f)},
+    {ImGuiCol_Border, ImVec4(0.24f, 0.28f, 0.36f, 0.65f)},
+    {ImGuiCol_FrameBg, ImVec4(0.145f, 0.17f, 0.22f, 1.00f)},
+    {ImGuiCol_FrameBgHovered, ImVec4(0.21f, 0.25f, 0.32f, 1.00f)},
+    {ImGuiCol_FrameBgActive, ImVec4(0.26f, 0.31f, 0.39f, 1.00f)},
+    {ImGuiCol_Button, ImVec4(0.17f, 0.21f, 0.28f, 1.00f)},
+    {ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.31f, 0.40f, 1.00f)},
+    {ImGuiCol_ButtonActive, ImVec4(0.30f, 0.39f, 0.50f, 1.00f)},
+    {ImGuiCol_Header, ImVec4(0.19f, 0.25f, 0.33f, 1.00f)},
+    {ImGuiCol_HeaderHovered, ImVec4(0.25f, 0.33f, 0.43f, 1.00f)},
+    {ImGuiCol_HeaderActive, ImVec4(0.29f, 0.39f, 0.51f, 1.00f)},
+    {ImGuiCol_Tab, ImVec4(0.13f, 0.15f, 0.20f, 1.00f)},
+    {ImGuiCol_TabHovered, ImVec4(0.24f, 0.32f, 0.42f, 1.00f)},
+    {ImGuiCol_TabSelected, ImVec4(0.19f, 0.25f, 0.33f, 1.00f)},
+    {ImGuiCol_CheckMark, ImVec4(0.35f, 0.80f, 0.67f, 1.00f)},
+    {ImGuiCol_SliderGrab, ImVec4(0.35f, 0.80f, 0.67f, 1.00f)},
+    {ImGuiCol_SliderGrabActive, ImVec4(0.45f, 0.90f, 0.78f, 1.00f)},
+    {ImGuiCol_Separator, ImVec4(0.28f, 0.33f, 0.42f, 0.70f)},
+    {ImGuiCol_Text, ImVec4(0.90f, 0.92f, 0.95f, 1.00f)},
+    {ImGuiCol_TextDisabled, ImVec4(0.58f, 0.62f, 0.70f, 1.00f)},
+    {ImGuiCol_ScrollbarBg, ImVec4(0.10f, 0.12f, 0.16f, 1.00f)},
+    {ImGuiCol_ScrollbarGrab, ImVec4(0.26f, 0.31f, 0.40f, 1.00f)},
+    {ImGuiCol_PopupBg, ImVec4(0.10f, 0.12f, 0.16f, 0.98f)},
+};
+
+void PushMenuStyle()
+{
+  for (const auto& entry : kMenuColors)
+    ImGui::PushStyleColor(entry.index, entry.color);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 4.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, ImVec2(6.0f, 4.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding, 6.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_TabRounding, 6.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 8.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 13.0f);
+}
+
+void PopMenuStyle()
+{
+  ImGui::PopStyleVar(11);
+  ImGui::PopStyleColor(IM_ARRAYSIZE(kMenuColors));
+}
+
+} // namespace
+
 void ConfigMenu::Draw() {
   const ImGuiIO &io = ImGui::GetIO();
   ++g_ui_frame;
@@ -802,6 +867,7 @@ void ConfigMenu::Draw() {
       std::clamp(io.DisplaySize.x - 20.0f, 320.0f, 720.0f);
   const float height =
       std::clamp(io.DisplaySize.y - 20.0f, 280.0f, 560.0f);
+  PushMenuStyle();
   ImGui::SetNextWindowPos(
       ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
       ImGuiCond_Always, ImVec2(0.5f, 0.5f));
@@ -872,6 +938,7 @@ void ConfigMenu::Draw() {
     ImGui::TextWrapped("%s", status.c_str());
   }
   ImGui::End();
+  PopMenuStyle();
 }
 
 void ConfigMenu::DrawDisplayTab() {
@@ -1413,9 +1480,22 @@ FindGameRoot(const std::string &disc_id, const std::filesystem::path &current,
   if (!current.empty() && current.has_parent_path())
     bases.push_back(current.parent_path());
 
+  // Read only sys/boot.bin. InspectGame() would also hash the whole files/
+  // archive (hundreds of MB) to fill assets_sha256, and the region scan probes
+  // several candidate directories per region -- which is why opening the System
+  // tab appeared to hang. The disc id lives in the first six bytes of boot.bin,
+  // so this is the whole check.
   const auto matches = [&](const std::filesystem::path &path) -> bool {
-    const auto inspected = moderngekko::InspectGame(path);
-    return inspected && inspected.metadata->disc_id == disc_id;
+    std::ifstream boot(path / "sys" / "boot.bin", std::ios::binary);
+    if (!boot)
+      return false;
+    char id[6]{};
+    boot.read(id, sizeof(id));
+    if (boot.gcount() != static_cast<std::streamsize>(sizeof(id)))
+      return false;
+    return std::equal(id, id + sizeof(id), disc_id.begin(), disc_id.end()) &&
+           std::all_of(id, id + sizeof(id),
+                       [](unsigned char c) { return std::isalnum(c) != 0; });
   };
 
   for (const auto &base : bases) {

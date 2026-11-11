@@ -699,12 +699,18 @@ bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
   }
   // --output is the artifact *directory*: the tool puts the library under
   // <dir>/<disc>/<dol-hash>/, so it is moved into place afterwards.
-  // --no-lto: an on-demand build is a one-shot for a player, and the ThinLTO
-  // link is both the slowest step (minutes) and the one that hung under Wine.
-  // Losing a few percent of peak speed is the right trade for a build that
-  // actually finishes.
+  // Optimisation matters here: this build produces the binary the player
+  // actually runs. -O3 is the same level the tuned builds use, and it is what
+  // the default -O2 was silently costing (the installer-built module ran well
+  // below the tuned one, which showed up as a slow intro).
   std::vector<std::string> storage = {port_tool.string(), "build", game_root.string(),
-                                      "--output", work_dir.string(), "--no-lto"};
+                                      "--output", work_dir.string(), "--opt-level", "3"};
+#if defined(_WIN32)
+  // ThinLTO's link is the one step that hung on Windows; a plain lld link
+  // finishes there. Linux/macOS keep LTO because it links reliably and buys
+  // real frame time.
+  storage.emplace_back("--no-lto");
+#endif
   // A MSVC-built port defaults to `cl` for "auto"; when the package ships its
   // own clang and the machine has no Visual Studio, name the compiler instead.
   if (bundled_toolchain)
