@@ -13,6 +13,13 @@
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -661,6 +668,12 @@ bool UseBundledToolchain(const fs::path& install_dir)
   const char* const existing = std::getenv(variable);
   const std::string combined = prefix + (existing ? existing : "");
 #if defined(_WIN32)
+  // _putenv_s only updates the CRT's copy of the environment; child processes
+  // inherit the Win32 process block, which needs SetEnvironmentVariable. With
+  // only _putenv_s the launched moderngekko-port (and the cmake it spawns) did
+  // not see Toolchain/bin, so CMake failed with "unable to find a build program
+  // corresponding to Ninja".
+  SetEnvironmentVariableA(variable, combined.c_str());
   _putenv_s(variable, combined.c_str());
 #else
   setenv(variable, combined.c_str(), 1);
