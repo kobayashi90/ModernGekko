@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -113,6 +114,25 @@ private:
   };
   // Scans for the other regions of the running title once, on first draw.
   void RefreshRegions();
+
+  // One extracted game version on disk. Unlike RegionChoice (which is derived
+  // from the running disc id and therefore covers exactly the regions this
+  // title shipped in), this is whatever the user actually has extracted: a
+  // debug build, a different revision, or a region the catalogue does not
+  // predict.
+  struct GameVersionEntry {
+    std::string disc_id;
+    std::string name;
+    std::filesystem::path game_root;
+    std::filesystem::path module;
+  };
+  void ScanVersions();
+  void ScanInstallImages();
+  // Runs the launcher's `--extract <image>` mode in a detached background
+  // thread. The runner does not link Dolphin's disc reader, the launcher does,
+  // so this is the only way to add a version without leaving the game. State
+  // lives in a shared_ptr because the thread outlives a quit request.
+  void InstallVersion(const std::filesystem::path &image);
   void RefreshDevices();
   void Save(const std::string &what);
   void SetStatus(std::string text);
@@ -217,6 +237,20 @@ private:
   std::vector<RegionChoice> m_regions;
   bool m_regions_scanned = false;
   std::string m_regions_game_id;
+  // Extracted versions + the disc images that can be installed from here.
+  std::vector<GameVersionEntry> m_versions;
+  bool m_versions_scanned = false;
+  std::string m_versions_game_id;
+  std::vector<std::filesystem::path> m_install_images;
+  bool m_install_images_scanned = false;
+  struct InstallState {
+    std::atomic<bool> running{false};
+    std::atomic<bool> finished{false};
+    int exit_code = 0;
+    std::mutex mutex;
+    std::string image;
+  };
+  std::shared_ptr<InstallState> m_install;
   std::array<std::string, 4> m_ports{};
   // What the live pad is actually configured with. A selection change is only
   // committed to m_ports after it was written to disk AND re-bound, so the UI

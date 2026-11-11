@@ -139,7 +139,11 @@ ConfigResult LoadConfig(const fs::path &user_directory,
   const fs::path path = user_directory / "config.ini";
   if (!fs::exists(path) && create_if_missing) {
     std::string error;
-    if (!SaveConfig(user_directory, "1920x1080", true, {}, &error))
+    // A fresh install starts on the settings this build is tuned for: 2x EFB
+    // (1280x720), Vulkan, vsync on. That is the configuration that holds 100 %
+    // on PAL's 50 Hz, so a first-time player gets the tested profile instead of
+    // whatever the defaults happened to be.
+    if (!SaveConfig(user_directory, "1280x720", true, {}, &error))
       return {.error = std::move(error)};
   }
 

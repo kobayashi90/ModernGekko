@@ -776,8 +776,12 @@ void ConfigMenu::DrawOverlayFrame() {
     ImGui::SetNextWindowFocus();
   // The OSD resets FontSizeBase from its config after ImGui::Render() every
   // frame, so bumping it here only affects our window this frame.
+  // Text scales with the panel: a 16 px font inside a 1150x820 panel on a
+  // 1382-tall backbuffer is unreadable small print.
+  const float ui_scale =
+      std::clamp(ImGui::GetIO().DisplaySize.y / 900.0f, 1.0f, 1.5f);
   ImGui::GetStyle().FontSizeBase =
-      std::max(ImGui::GetStyle().FontSizeBase, 16.0f);
+      std::max(ImGui::GetStyle().FontSizeBase, 16.0f * ui_scale);
   Draw();
 }
 
@@ -861,12 +865,17 @@ void ConfigMenu::Draw() {
                    io.MouseDown[0] ? 1 : 0);
     }
   }
-  // Fit the menu inside the game window's backbuffer (small windows get a
-  // margin instead of overflowing).
+  // The panel is a share of the backbuffer, not a fixed 720x560: at a 2560-wide
+  // window the fixed size looked like a postage stamp and the System tab had to
+  // scroll three rows of text in a box the size of a business card. The caps
+  // keep it sane on a small window and stop it from becoming a full-screen
+  // settings wall on a 4K one.
   const float width =
-      std::clamp(io.DisplaySize.x - 20.0f, 320.0f, 720.0f);
+      std::clamp(io.DisplaySize.x * 0.45f, 320.0f,
+                 std::min(io.DisplaySize.x - 20.0f, 1180.0f));
   const float height =
-      std::clamp(io.DisplaySize.y - 20.0f, 280.0f, 560.0f);
+      std::clamp(io.DisplaySize.y * 0.60f, 280.0f,
+                 std::min(io.DisplaySize.y - 20.0f, 820.0f));
   PushMenuStyle();
   ImGui::SetNextWindowPos(
       ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
@@ -875,10 +884,22 @@ void ConfigMenu::Draw() {
   ImGui::Begin("Settings", nullptr,
                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
                    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove);
-  ImGui::TextDisabled("%s [%s] — emulation paused while this menu is open",
-                      m_hooks.game_name.c_str(), m_hooks.disc_id.c_str());
-  ImGui::Separator();
-  if (ImGui::BeginTabBar("settings-tabs")) {
+  // Accent, not TextDisabled: the header is the one line that says which game
+  // is paused, so it should read as a header instead of grey fine print.
+  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.85f, 0.78f, 1.00f));
+  ImGui::Text("%s [%s] — emulation paused while this menu is open",
+              m_hooks.game_name.c_str(), m_hooks.disc_id.c_str());
+  ImGui::PopStyleColor();
+  // No separator here: the tab bar already reads as a section break, and the
+  // extra rule pushed the header text far enough from the tabs that it stopped
+  // reading as their heading.
+  // Tighter spacing before the tab bar: the header line is the heading for the
+  // tabs, and the default gap made it read as a separate, unrelated row.
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                      ImVec2(ImGui::GetStyle().ItemSpacing.x, 2.0f));
+  const bool tab_bar_visible = ImGui::BeginTabBar("settings-tabs");
+  ImGui::PopStyleVar();
+  if (tab_bar_visible) {
     // The rect is logged immediately after BeginTabItem, not after EndTabItem.
     // EndTabItem does not restore ImGui's "last item" state, so for the *selected*
     // tab it still described whatever was drawn last inside the content -- the
@@ -1627,6 +1648,187 @@ void ConfigMenu::RefreshRegions() {
   }
 }
 
+namespace {
+
+// Where a player's disc images actually live. Documents is the launcher's
+// default; Downloads is where a browser puts them, which on this machine (and
+// most others) is where they end up.
+std::vector<std::filesystem::path> ImageDirectories() {
+  std::vector<std::filesystem::path> directories;
+#if defined(_WIN32)
+  const char *home = std::getenv("USERPROFILE");
+#else
+  const char *home = std::getenv("HOME");
+#endif
+  if (!home)
+    return directories;
+  directories.push_back(std::filesystem::path(home) / "Documents");
+  directories.push_back(std::filesystem::path(home) / "Downloads");
+  return directories;
+}
+
+// sys/boot.bin holds everything this tab needs to name a version: the six-byte
+// disc id at offset 0 and the game title at 0x20. Reading those costs one open
+// and one read; InspectGame() would additionally SHA-256 the whole files/
+// archive, which is why the old scan made this tab look frozen.
+bool ReadBootIdentity(const std::filesystem::path &root, std::string *disc_id,
+                      std::string *name) {
+  std::ifstream boot(root / "sys" / "boot.bin", std::ios::binary);
+  if (!boot)
+    return false;
+  std::array<char, 0x60> header{};
+  boot.read(header.data(), header.size());
+  if (boot.gcount() != static_cast<std::streamsize>(header.size()))
+    return false;
+  std::string id(header.data(), 6);
+  if (id.size() != 6 ||
+      !std::all_of(id.begin(), id.end(),
+                   [](unsigned char c) { return std::isalnum(c) != 0; }))
+    return false;
+  std::string title(header.data() + 0x20, 0x40);
+  if (const auto terminator = title.find('\0'); terminator != std::string::npos)
+    title.resize(terminator);
+  while (!title.empty() && std::isspace(static_cast<unsigned char>(title.back())))
+    title.pop_back();
+  if (title.empty())
+    title = id;
+  *disc_id = std::move(id);
+  *name = std::move(title);
+  return true;
+}
+
+// The launcher is the binary that carries Dolphin's disc reader, so it is what
+// `--extract` has to run. It sits beside the runner in every packaged layout;
+// the extra names cover the dev tree and the Windows/macOS builds.
+std::filesystem::path LauncherBeside(const std::filesystem::path &directory) {
+  static const char *kNames[] = {"Beach Spikers", "Beach Spikers.exe",
+                                 "moderngekko-launcher",
+                                 "moderngekko-launcher.exe", "beach-spikers"};
+  std::error_code ec;
+  for (const char *name : kNames) {
+    const auto candidate = directory / name;
+    if (std::filesystem::is_regular_file(candidate, ec))
+      return candidate;
+  }
+  return {};
+}
+
+} // namespace
+
+void ConfigMenu::ScanVersions() {
+  m_versions.clear();
+  m_versions_scanned = true;
+  m_versions_game_id = m_hooks.disc_id;
+  const auto consider = [&](const std::filesystem::path &root) {
+    std::string disc_id;
+    std::string name;
+    if (!ReadBootIdentity(root, &disc_id, &name))
+      return;
+    // One row per disc id: the running root is considered first, so a second
+    // directory holding the same version does not show up as a duplicate.
+    for (const auto &existing : m_versions) {
+      if (existing.disc_id == disc_id)
+        return;
+    }
+    GameVersionEntry entry;
+    entry.disc_id = std::move(disc_id);
+    entry.name = std::move(name);
+    entry.game_root = root;
+    entry.module = FindModule(entry.disc_id, m_hooks.disc_id,
+                              m_hooks.executable_directory,
+                              m_hooks.user_directory, m_hooks.module_path);
+    m_versions.push_back(std::move(entry));
+  };
+
+  // The running game belongs in the list even when it lives outside
+  // <user>/games (dev tree, or a --game argument).
+  if (!m_hooks.game_root.empty())
+    consider(m_hooks.game_root);
+  std::error_code ec;
+  const auto games = m_hooks.user_directory / "games";
+  for (std::filesystem::directory_iterator it(games, ec), end;
+       !ec && it != end; it.increment(ec)) {
+    std::error_code type_error;
+    if (!it->is_directory(type_error))
+      continue;
+    consider(it->path());
+  }
+  std::sort(m_versions.begin(), m_versions.end(),
+            [](const GameVersionEntry &a, const GameVersionEntry &b) {
+              return a.disc_id < b.disc_id;
+            });
+}
+
+void ConfigMenu::ScanInstallImages() {
+  m_install_images.clear();
+  m_install_images_scanned = true;
+  // Same rule as the launcher's Browse list: disc images live in a shallow
+  // folder, so cap the walk instead of scanning a whole drive.
+  for (const auto &directory : ImageDirectories()) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(directory, ec))
+      continue;
+    std::filesystem::recursive_directory_iterator it(
+        directory, std::filesystem::directory_options::skip_permission_denied,
+        ec);
+    const std::filesystem::recursive_directory_iterator end;
+    while (!ec && it != end) {
+      if (it.depth() > 4)
+        it.disable_recursion_pending();
+      std::error_code file_error;
+      if (it->is_regular_file(file_error)) {
+        std::string extension = it->path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char c) {
+                         return static_cast<char>(std::tolower(c));
+                       });
+        if (extension == ".iso" || extension == ".wbfs" || extension == ".rvz")
+          m_install_images.push_back(it->path());
+      }
+      it.increment(ec);
+      if (ec)
+        ec.clear();
+    }
+  }
+  std::sort(m_install_images.begin(), m_install_images.end());
+}
+
+void ConfigMenu::InstallVersion(const std::filesystem::path &image) {
+  if (!m_install)
+    m_install = std::make_shared<InstallState>();
+  if (m_install->running.load())
+    return;
+  const auto launcher = LauncherBeside(m_hooks.executable_directory);
+  if (launcher.empty()) {
+    SetStatus("no launcher next to the game - extract from the launcher window");
+    std::fprintf(stderr,
+                 "[menu] install: no launcher found in %s\n",
+                 m_hooks.executable_directory.string().c_str());
+    return;
+  }
+  // Quoted for both shells: the paths routinely contain spaces ("Beach
+  // Spikers", "Beach Spikers - Virtua Beach Volleyball (USA).rvz").
+  const std::string command =
+      "\"" + launcher.string() + "\" --extract \"" + image.string() + "\"";
+  auto state = m_install;
+  {
+    std::lock_guard lock(state->mutex);
+    state->image = image.filename().string();
+  }
+  state->finished.store(false);
+  state->running.store(true);
+  std::fprintf(stderr, "[menu] install: %s\n", command.c_str());
+  SetStatus("extracting " + image.filename().string() + " - this takes a few minutes");
+  // Detached on purpose: extraction can outlive a quit request, and the state
+  // it writes is owned by a shared_ptr, not by this object.
+  std::thread([state, command] {
+    const int rc = std::system(command.c_str());
+    state->exit_code = rc;
+    state->running.store(false);
+    state->finished.store(true);
+  }).detach();
+}
+
 std::string ConfigMenu::RegionSwitchGameRoot() const {
   std::lock_guard lock(m_region_mutex);
   return m_region_game_root;
@@ -1638,13 +1840,19 @@ std::string ConfigMenu::RegionSwitchModule() const {
 }
 
 void ConfigMenu::DrawSystemTab() {
-  ImGui::TextWrapped("Game: %s", m_hooks.game_name.c_str());
-  ImGui::TextWrapped("Disc ID: %s", m_hooks.disc_id.c_str());
+  ImGui::Text("Game: %s [%s]", m_hooks.game_name.c_str(),
+              m_hooks.disc_id.c_str());
   ImGui::TextWrapped("User directory: %s",
                      m_hooks.user_directory.string().c_str());
-  ImGui::TextWrapped("Module: %s",
-                     m_hooks.module_path.empty() ? "(auto)"
-                                                  : m_hooks.module_path.c_str());
+  // The module path is a 150-character hash directory; wrapped it costs three
+  // lines of the panel to say nothing a tooltip cannot say on hover.
+  const std::string module_name =
+      m_hooks.module_path.empty() ?
+          "(auto)" :
+          std::filesystem::path(m_hooks.module_path).filename().string();
+  ImGui::Text("Module: %s", module_name.c_str());
+  if (!m_hooks.module_path.empty() && ImGui::IsItemHovered())
+    ImGui::SetTooltip("%s", m_hooks.module_path.c_str());
   ImGui::Spacing();
   ImGui::Separator();
 
@@ -1680,10 +1888,8 @@ void ConfigMenu::DrawSystemTab() {
     ImGui::EndCombo();
   }
   LogItemRect("widget", "language");
-  Description("Stored in the emulated console's SRAM when the game boots, so "
-              "it takes effect after a restart. Multi-language PAL discs use "
-              "it. An NTSC disc usually ships English only, so the choice may "
-              "have no visible effect.");
+  Description("Written to the emulated console's SRAM at boot: restart to "
+              "apply. NTSC discs usually ship English only.");
 
   ImGui::Spacing();
   ImGui::Separator();
@@ -1742,10 +1948,96 @@ void ConfigMenu::DrawSystemTab() {
       ImGui::EndCombo();
     }
     LogItemRect("widget", "region");
-    ImGui::TextWrapped(
-        "Restarts on the selected disc. Savestates are per-region, so the "
-        "current one is not carried across.");
+    ImGui::TextDisabled("Restarts; savestates are per-region.");
   }
+
+  ImGui::Spacing();
+  ImGui::Separator();
+
+  // --- Installed versions ------------------------------------------------
+  // The combo above is the catalogue of retail regions; this is what is on
+  // disk. They are not the same list: a second revision or a dev extract is a
+  // version the catalogue cannot predict, and it should still be switchable.
+  if (m_install && m_install->finished.exchange(false))
+    m_versions_scanned = false;
+  if (!m_versions_scanned || m_versions_game_id != m_hooks.disc_id)
+    ScanVersions();
+  ImGui::TextDisabled("Installed versions");
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Rescan")) {
+    m_versions_scanned = false;
+    m_install_images_scanned = false;
+  }
+  // One bounded, scrollable box for both lists. Bounded because the tab has to
+  // stay inside the panel even with a dozen extractions, and a list that grows
+  // the window hides the buttons at the bottom (the bug this menu had before it
+  // was split into tabs); one box because two headings and two framed children
+  // cost more height than the tab has to spare.
+  const float versions_height =
+      ImGui::GetTextLineHeightWithSpacing() * 5.0f;
+  ImGui::BeginChild("##installed_versions", ImVec2(0.0f, versions_height),
+                    ImGuiChildFlags_Borders);
+  for (const auto &entry : m_versions) {
+    ImGui::PushID(entry.disc_id.c_str());
+    const bool running = entry.disc_id == m_hooks.disc_id;
+    const char region_letter =
+        entry.disc_id.size() == 6 ? entry.disc_id[3] : '?';
+    ImGui::Text("%s [%s - %s]", entry.name.c_str(), entry.disc_id.c_str(),
+                RegionLabel(region_letter).c_str());
+    ImGui::SameLine();
+    if (running) {
+      ImGui::TextDisabled("running");
+    } else if (entry.module.empty()) {
+      ImGui::TextDisabled("no module - build it in the launcher");
+    } else if (ImGui::SmallButton("Switch")) {
+      // Rect logged like every other actionable widget in this tab: the harness
+      // asserts controls fit the panel, and a click test needs the real
+      // coordinates instead of eyeballed ones.
+      std::lock_guard lock(m_region_mutex);
+      m_region_game_root = entry.game_root.string();
+      m_region_module = entry.module.string();
+      m_region_switch.store(true);
+      m_restart.store(true);
+      std::fprintf(stderr,
+                   "[menu] version switch requested: %s -> %s\n",
+                   m_hooks.disc_id.c_str(), entry.disc_id.c_str());
+      SetStatus("switching to " + entry.name + " (" + entry.disc_id + ")…");
+      if (m_runtime)
+        m_runtime->RequestStop();
+    }
+    if (!running && !entry.module.empty())
+      LogItemRect("widget", "switch-" + entry.disc_id);
+    ImGui::PopID();
+  }
+
+  // Installing needs Dolphin's disc reader, which only the launcher links, so
+  // the row spawns the launcher's `--extract` mode in the background.
+  ImGui::Separator();
+  if (m_install && m_install->running.load()) {
+    std::string image;
+    {
+      std::lock_guard lock(m_install->mutex);
+      image = m_install->image;
+    }
+    ImGui::TextDisabled("Extracting %s…", image.c_str());
+  } else {
+    if (!m_install_images_scanned)
+      ScanInstallImages();
+    if (m_install_images.empty()) {
+      ImGui::TextDisabled("Install: no ISO, WBFS or RVZ in Documents.");
+    } else {
+      ImGui::TextDisabled("Install:");
+      for (const auto &image : m_install_images) {
+        ImGui::PushID(image.string().c_str());
+        ImGui::TextUnformatted(image.filename().string().c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Extract"))
+          InstallVersion(image);
+        ImGui::PopID();
+      }
+    }
+  }
+  ImGui::EndChild();
 
   ImGui::Spacing();
   ImGui::Separator();

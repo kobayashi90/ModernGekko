@@ -301,6 +301,130 @@ fs::path ReadDefaultGame(const fs::path& user_directory, const fs::path& release
 // Losing it used to make the launcher ask for the ISO again even though the
 // extracted game was sitting right there, so look for it before believing there
 // is no game.
+// Identity-only inspection: reads sys/boot.bin and nothing else.
+//
+// InspectGame() also hashes the whole files/ archive (hundreds of megabytes)
+// to fill assets_sha256. The launcher needs a name and a disc id for the window
+// and for picking a module, so paying that cost -- at startup and again for
+// every listed extraction -- is pure waste. The pinned-build checks still use
+// the full inspection when the release actually pins hashes.
+std::optional<moderngekko::GameMetadata> InspectGameIdentity(const fs::path& game_root)
+{
+  std::error_code ec;
+  const fs::path root = fs::weakly_canonical(game_root, ec);
+  if (ec || !fs::is_directory(root, ec))
+    return std::nullopt;
+  const fs::path boot_path = root / "sys" / "boot.bin";
+  const fs::path dol_path = root / "sys" / "main.dol";
+  if (!fs::is_regular_file(boot_path, ec) || !fs::is_regular_file(dol_path, ec))
+    return std::nullopt;
+
+  std::ifstream boot(boot_path, std::ios::binary);
+  if (!boot)
+    return std::nullopt;
+  std::array<char, 0x60> header{};
+  boot.read(header.data(), header.size());
+  if (boot.gcount() != static_cast<std::streamsize>(header.size()))
+    return std::nullopt;
+
+  std::string disc_id(header.data(), 6);
+  if (disc_id.size() != 6 ||
+      !std::all_of(disc_id.begin(), disc_id.end(),
+                   [](unsigned char c) { return std::isalnum(c) != 0; }))
+    return std::nullopt;
+
+  std::string name(header.data() + 0x20, 0x40);
+  if (const auto terminator = name.find('\0'); terminator != std::string::npos)
+    name.resize(terminator);
+  while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back())))
+    name.pop_back();
+  if (name.empty())
+    name = disc_id;
+
+  const auto read_be32 = [&](std::size_t offset)
+  {
+    return (static_cast<std::uint32_t>(static_cast<unsigned char>(header[offset])) << 24) |
+           (static_cast<std::uint32_t>(static_cast<unsigned char>(header[offset + 1])) << 16) |
+           (static_cast<std::uint32_t>(static_cast<unsigned char>(header[offset + 2])) << 8) |
+           static_cast<std::uint32_t>(static_cast<unsigned char>(header[offset + 3]));
+  };
+  const std::uint32_t wii_magic = read_be32(0x18);
+  const std::uint32_t gc_magic = read_be32(0x1c);
+
+  moderngekko::GameMetadata metadata;
+  metadata.root = root;
+  metadata.main_dol = dol_path;
+  metadata.game_name = std::move(name);
+  metadata.disc_id = std::move(disc_id);
+  metadata.platform = wii_magic == 0x5d1c9ea3 ? moderngekko::GamePlatform::Wii
+                                              : moderngekko::GamePlatform::GameCube;
+  return metadata;
+}
+
+// One extracted game version found under <user>/games.
+struct ExtractedGame
+{
+  fs::path root;
+  std::string disc_id;
+  std::string name;
+};
+
+std::vector<ExtractedGame> ListExtractedGames(const fs::path& user_directory)
+{
+  std::vector<ExtractedGame> games;
+  std::error_code ec;
+  const fs::path games_root = user_directory / "games";
+  for (fs::directory_iterator it(games_root, ec), end; !ec && it != end; it.increment(ec))
+  {
+    if (!it->is_directory(ec))
+      continue;
+    const auto identity = InspectGameIdentity(it->path());
+    if (!identity)
+      continue;
+    games.push_back({identity->root, identity->disc_id, identity->game_name});
+  }
+  std::ranges::sort(games, {}, &ExtractedGame::disc_id);
+  return games;
+}
+
+// Human-readable region from the disc ID's fourth character (Nintendo's
+// convention: <product><region><disc><version>). The launcher deals in disc
+// IDs everywhere, but "GBSP8P" means nothing to a player who owns one disc and
+// has to pick which version the module should be built for.
+std::string RegionLabel(const std::string& disc_id)
+{
+  if (disc_id.size() < 4)
+    return "unknown region";
+  switch (disc_id[3])
+  {
+  case 'E':
+    return "NTSC-U";
+  case 'J':
+    return "NTSC-J";
+  case 'P':
+    return "PAL";
+  case 'D':
+    return "PAL (Germany)";
+  case 'F':
+    return "PAL (France)";
+  case 'I':
+    return "PAL (Italy)";
+  case 'S':
+    return "PAL (Spain)";
+  case 'K':
+    return "NTSC-K";
+  case 'R':
+    return "PAL (Russia)";
+  default:
+    return "region " + std::string(1, disc_id[3]);
+  }
+}
+
+std::string GameVersionLabel(const ExtractedGame& game)
+{
+  return game.name + "  [" + game.disc_id + " - " + RegionLabel(game.disc_id) + "]";
+}
+
 fs::path DiscoverExtractedGame(const fs::path& user_directory,
                                const fs::path& release_directory)
 {
@@ -704,7 +828,7 @@ bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
   // the default -O2 was silently costing (the installer-built module ran well
   // below the tuned one, which showed up as a slow intro).
   std::vector<std::string> storage = {port_tool.string(), "build", game_root.string(),
-                                      "--output", work_dir.string(), "--opt-level", "3"};
+                                      "--output", work_dir.string(), "--opt-level", "2"};
 #if defined(_WIN32)
   // ThinLTO's link is the one step that hung on Windows; a plain lld link
   // finishes there. Linux/macOS keep LTO because it links reliably and buys
@@ -846,8 +970,10 @@ int main(int argc, char** argv)
     return 1;
 
   const float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
-  SDL_Window* window = SDL_CreateWindow(MODERNGEKKO_FRONTEND_NAME, static_cast<int>(820 * scale),
-                                        static_cast<int>(700 * scale),
+  // Wide enough for the themed padding and for the game-version list; the
+  // window is resizable so a long path or a small screen still fits.
+  SDL_Window* window = SDL_CreateWindow(MODERNGEKKO_FRONTEND_NAME, static_cast<int>(980 * scale),
+                                        static_cast<int>(650 * scale),
                                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
   if (!window)
   {
@@ -875,6 +1001,38 @@ int main(int argc, char** argv)
   ImGui::StyleColorsDark();
   ImGui::GetStyle().ScaleAllSizes(scale);
   ImGui::GetStyle().FontScaleDpi = scale;
+  // Same palette as the in-game F1 overlay, so the launcher and the settings
+  // menu do not look like two different programs.
+  {
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 10.0f * scale;
+    style.FrameRounding = 6.0f * scale;
+    style.GrabRounding = 6.0f * scale;
+    style.TabRounding = 6.0f * scale;
+    style.ScrollbarRounding = 8.0f * scale;
+    style.WindowPadding = ImVec2(18.0f * scale, 16.0f * scale);
+    style.FramePadding = ImVec2(10.0f * scale, 6.0f * scale);
+    style.ItemSpacing = ImVec2(10.0f * scale, 8.0f * scale);
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_WindowBg] = ImVec4(0.075f, 0.085f, 0.115f, 1.00f);
+    colors[ImGuiCol_Border] = ImVec4(0.24f, 0.28f, 0.36f, 0.65f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.145f, 0.17f, 0.22f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.21f, 0.25f, 0.32f, 1.00f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.26f, 0.31f, 0.39f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.17f, 0.21f, 0.28f, 1.00f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.24f, 0.31f, 0.40f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.30f, 0.39f, 0.50f, 1.00f);
+    colors[ImGuiCol_Header] = ImVec4(0.19f, 0.25f, 0.33f, 1.00f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.25f, 0.33f, 0.43f, 1.00f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.29f, 0.39f, 0.51f, 1.00f);
+    colors[ImGuiCol_CheckMark] = ImVec4(0.35f, 0.80f, 0.67f, 1.00f);
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.35f, 0.80f, 0.67f, 1.00f);
+    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.45f, 0.90f, 0.78f, 1.00f);
+    colors[ImGuiCol_Separator] = ImVec4(0.28f, 0.33f, 0.42f, 0.70f);
+    colors[ImGuiCol_Text] = ImVec4(0.90f, 0.92f, 0.95f, 1.00f);
+    colors[ImGuiCol_TextDisabled] = ImVec4(0.58f, 0.62f, 0.70f, 1.00f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.10f, 0.12f, 0.16f, 0.98f);
+  }
   ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
   ImGui_ImplSDLRenderer3_Init(renderer);
 
@@ -904,13 +1062,65 @@ int main(int argc, char** argv)
     current_game = DiscoverExtractedGame(user_directory, release_directory);
   bool current_dol_changed = false;
   std::string current_dol_error;
+  auto inspect_current = [&](const fs::path& root) -> moderngekko::GameInspectResult
+  {
+#if defined(MODERNGEKKO_REQUIRED_DOL_SHA256) || defined(MODERNGEKKO_REQUIRED_REL_SHA256) || \
+    defined(MODERNGEKKO_REQUIRED_ASSETS_SHA256)
+    return moderngekko::InspectGame(root);
+#else
+    if (auto identity = InspectGameIdentity(root))
+      return {std::move(*identity), {}};
+    return moderngekko::InspectGame(root);
+#endif
+  };
   auto current_metadata =
       ApplyBundledDolPatch(current_game, release_directory, &current_dol_changed,
                            &current_dol_error) ?
-          moderngekko::InspectGame(current_game) :
+          inspect_current(current_game) :
           moderngekko::GameInspectResult{{}, current_dol_error};
   if (current_metadata && !RequiredGameError(*current_metadata.metadata).empty())
     current_metadata = {{}, RequiredGameError(*current_metadata.metadata)};
+
+  // Every previously extracted version, so a player can switch region without
+  // hunting for the folder. The active game is folded in as well: it can live
+  // outside <user>/games (the dev layout, a portable build, or a path the
+  // player wrote into default-game.txt), and a version list that omits the
+  // running version would be worse than no list at all.
+  std::vector<ExtractedGame> extracted_games = ListExtractedGames(user_directory);
+  const auto refresh_extracted_games = [&]
+  {
+    extracted_games = ListExtractedGames(user_directory);
+    if (!current_metadata)
+      return;
+    const std::string& id = current_metadata.metadata->disc_id;
+    const bool listed = std::ranges::any_of(
+        extracted_games, [&](const ExtractedGame& game) { return game.disc_id == id; });
+    if (!listed)
+    {
+      extracted_games.push_back({current_game, id,
+                                 current_metadata.metadata->game_name});
+      std::ranges::sort(extracted_games, {}, &ExtractedGame::disc_id);
+    }
+  };
+  refresh_extracted_games();
+  // Switching version only swaps which game the Play button targets; it must
+  // never start emulation on its own. Same for extracting a second region.
+  const auto select_version = [&](const ExtractedGame& game)
+  {
+    current_game = game.root;
+    current_metadata = inspect_current(game.root);
+    if (current_metadata && !RequiredGameError(*current_metadata.metadata).empty())
+      current_metadata = {{}, RequiredGameError(*current_metadata.metadata)};
+    std::string ignored;
+    WriteDefaultGame(user_directory, release_directory, current_game, &ignored);
+    LauncherLog("selected game version: %s (%s)", game.disc_id.c_str(),
+                game.root.string().c_str());
+  };
+  // Set by the "Extract another version" path: the extraction finishes into the
+  // list, not into a launch.
+  bool extract_without_launch = false;
+  bool show_extract_panel = false;
+
   const auto& resolutions = moderngekko::frontend::SupportedResolutions();
   const auto& graphics_backends =
       moderngekko::frontend::SupportedGraphicsBackends();
@@ -1173,6 +1383,12 @@ int main(int argc, char** argv)
     SDL_Event event;
     while (SDL_PollEvent(&event))
     {
+      if (SDL_getenv("MODERNGEKKO_LAUNCHER_MOUSE_DEBUG") &&
+          (event.type == SDL_EVENT_MOUSE_MOTION ||
+           event.type == SDL_EVENT_MOUSE_BUTTON_DOWN))
+        std::fprintf(stderr, "[sdl-mouse] type=%u x=%.0f y=%.0f which=%u\n",
+                     static_cast<unsigned>(event.type), event.motion.x, event.motion.y,
+                     static_cast<unsigned>(event.motion.which));
       ImGui_ImplSDL3_ProcessEvent(&event);
       if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED)
         done = true;
@@ -1198,11 +1414,26 @@ int main(int argc, char** argv)
       if (extraction.finished_game)
       {
         current_game = *extraction.finished_game;
-        current_metadata = moderngekko::InspectGame(current_game);
+        current_metadata = inspect_current(current_game);
         if (current_metadata && !RequiredGameError(*current_metadata.metadata).empty())
           current_metadata = {{}, RequiredGameError(*current_metadata.metadata)};
         extraction.finished_game.reset();
-        request_launch(LaunchMode::Solo);
+        std::string ignored;
+        WriteDefaultGame(user_directory, release_directory, current_game, &ignored);
+        refresh_extracted_games();
+        if (extract_without_launch)
+        {
+          // Keep the window (and the old version's list entry) usable; the
+          // player presses Play when they are ready.
+          extract_without_launch = false;
+          show_extract_panel = false;
+          LauncherLog("extracted an additional version without launching: %s",
+                      current_game.string().c_str());
+        }
+        else
+        {
+          request_launch(LaunchMode::Solo);
+        }
       }
     }
 
@@ -1228,10 +1459,102 @@ int main(int argc, char** argv)
     ImGui::TextUnformatted(MODERNGEKKO_FRONTEND_NAME);
     ImGui::Separator();
 
+    // Two columns: everything that decides *what* runs on the left, everything
+    // that decides *how* it looks (plus the disc image) on the right. Stacked in
+    // one column the settings ran past the bottom of the window, which hid the
+    // last rows behind a scrollbar nobody noticed.
+    const float column_gap = 22.0f * scale;
+    const float column_width =
+        (ImGui::GetContentRegionAvail().x - column_gap) * 0.5f;
+    ImGui::BeginChild("##launcher_left", ImVec2(column_width, 0),
+                      ImGuiChildFlags_None);
+
+    // --- Game version ------------------------------------------------------
+    // A build can hold several extracted versions (PAL / NTSC-U / NTSC-J).
+    // Each one needs its own recompiled module, so which version is active is
+    // not cosmetic -- it decides what Play builds and runs.
+    {
+      ImGui::TextUnformatted("Game version");
+      ImGui::SameLine();
+      if (ImGui::SmallButton(show_extract_panel ? "Hide extractor" : "Extract another version..."))
+        show_extract_panel = !show_extract_panel;
+      ImGui::SameLine();
+      ImGui::TextDisabled("%zu extracted", extracted_games.size());
+
+      if (extracted_games.empty())
+      {
+        ImGui::TextDisabled(
+            "No extracted version yet - use the disc image section below.");
+      }
+      else
+      {
+        const std::string preview =
+            current_metadata ?
+                GameVersionLabel({current_game, current_metadata.metadata->disc_id,
+                                  current_metadata.metadata->game_name}) :
+                "Choose an extracted version";
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##game_version", preview.c_str()))
+        {
+          for (const ExtractedGame& game : extracted_games)
+          {
+            const bool selected =
+                current_metadata && game.disc_id == current_metadata.metadata->disc_id;
+            if (ImGui::Selectable(GameVersionLabel(game).c_str(), selected) &&
+                !selected)
+            {
+              select_version(game);
+            }
+            if (selected)
+              ImGui::SetItemDefaultFocus();
+          }
+          ImGui::EndCombo();
+        }
+        // The extraction path is long enough to run past the window edge, so
+        // it lives in a tooltip instead of on the row.
+        if (current_metadata && ImGui::IsItemHovered())
+          ImGui::SetTooltip("%s", current_game.string().c_str());
+      }
+
+      if (show_extract_panel)
+      {
+        ImGui::Separator();
+        ImGui::TextWrapped(
+            "Extract another region's disc. It is added to the list above and "
+            "stays inactive until you press Play.");
+        if (selected_image)
+          ImGui::TextWrapped("%s", selected_image->string().c_str());
+        else
+          ImGui::TextDisabled("No ISO, WBFS, or RVZ selected");
+        ImGui::BeginDisabled(extraction.running);
+        if (ImGui::Button("Browse for ISO / WBFS / RVZ"))
+          ShowDiscImageDialog(window, &dialog);
+        if (selected_image)
+        {
+          ImGui::SameLine();
+          if (ImGui::Button("Extract version"))
+          {
+            extract_without_launch = true;
+            begin_extraction(*selected_image);
+          }
+        }
+        ImGui::EndDisabled();
+        if (extraction.running)
+        {
+          const float progress = std::min(
+              1.0f, static_cast<float>(extraction.completed.load()) /
+                        extraction.total.load());
+          ImGui::ProgressBar(progress, ImVec2(-1, 0));
+        }
+      }
+      ImGui::Separator();
+    }
+
     if (current_metadata)
     {
-      ImGui::Text("Ready: %s [%s]", current_metadata.metadata->game_name.c_str(),
-                  current_metadata.metadata->disc_id.c_str());
+      ImGui::Text("Ready: %s [%s - %s]", current_metadata.metadata->game_name.c_str(),
+                  current_metadata.metadata->disc_id.c_str(),
+                  RegionLabel(current_metadata.metadata->disc_id).c_str());
       if (!launcher_savestates.empty())
       {
         ImGui::TextUnformatted("Start from savestate");
@@ -1241,7 +1564,8 @@ int main(int argc, char** argv)
                     launcher_savestates[static_cast<std::size_t>(selected_savestate)],
                     selected_savestate == 0) :
                 "Normal boot";
-        if (ImGui::BeginCombo("##launch_savestate", savestate_preview.c_str()))
+        ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##launch_savestate", savestate_preview.c_str()))
         {
           const bool normal_boot_selected = selected_savestate < 0;
           if (ImGui::Selectable("Normal boot", normal_boot_selected))
@@ -1266,10 +1590,14 @@ int main(int argc, char** argv)
         ImGui::TextDisabled("Solo play only.");
         ImGui::Spacing();
       }
-      if (ImGui::Button("Play", ImVec2(180 * scale, 42 * scale)))
+      // Share the columns's width: three fixed 180 px buttons overflowed it.
+      const float button_width =
+          (ImGui::GetContentRegionAvail().x -
+           ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
+      if (ImGui::Button("Play", ImVec2(button_width, 42 * scale)))
         request_launch(LaunchMode::Solo);
       ImGui::SameLine();
-      if (ImGui::Button("Host Netplay", ImVec2(180 * scale, 42 * scale)))
+      if (ImGui::Button("Host Netplay", ImVec2(button_width, 42 * scale)))
       {
         if (ensure_controller())
         {
@@ -1296,7 +1624,7 @@ int main(int argc, char** argv)
         }
       }
       ImGui::SameLine();
-      if (ImGui::Button("Join Netplay", ImVec2(180 * scale, 42 * scale)))
+      if (ImGui::Button("Join Netplay", ImVec2(button_width, 42 * scale)))
       {
         if (ensure_controller())
         {
@@ -1329,6 +1657,55 @@ int main(int argc, char** argv)
     }
 
     ImGui::Spacing();
+    ImGui::TextUnformatted("Controller profile");
+    const char* controller_preview = controller_index >= 0
+                                         ? controllers[controller_index].label.c_str()
+                                     : selected_controller.empty() ? "No SDL gamepad detected"
+                                                                   : selected_controller.c_str();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##controller", controller_preview))
+    {
+      for (std::size_t i = 0; i < controllers.size(); ++i)
+      {
+        const bool selected = controller_index == static_cast<int>(i);
+        if (ImGui::Selectable(controllers[i].label.c_str(), selected))
+        {
+          controller_index = static_cast<int>(i);
+          selected_controller = controllers[i].device;
+          controller_status =
+              controller_profile_exists
+                  ? "Existing " + std::string(CONTROLLER_PROFILE_NAME) + " unchanged"
+                  : "Ready to generate controller profile";
+        }
+        if (selected)
+          ImGui::SetItemDefaultFocus();
+      }
+      ImGui::EndCombo();
+    }
+    ImGui::BeginDisabled(controller_index < 0);
+    const std::string replace_profile =
+        "Replace with generated " + std::string(GENERATED_PROFILE_LABEL);
+    if (ImGui::Button(replace_profile.c_str()))
+      select_controller(controller_index);
+    ImGui::EndDisabled();
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Netplay");
+    ImGui::SetNextItemWidth(220 * scale);
+    ImGui::InputText("Nickname", netplay_nickname.data(), netplay_nickname.size());
+    ImGui::SetNextItemWidth(220 * scale);
+    ImGui::InputText("Host / IP", netplay_address.data(), netplay_address.size());
+    ImGui::SetNextItemWidth(120 * scale);
+    ImGui::InputInt("UDP port", &netplay_port);
+    netplay_port = std::clamp(netplay_port, 1, 65535);
+    ImGui::Checkbox("Automatic input buffer", &automatic_buffer);
+    if (!automatic_buffer)
+    {
+      ImGui::SetNextItemWidth(180 * scale);
+      ImGui::SliderInt("Buffer frames", &manual_buffer, 1, 20);
+    }
+    ImGui::EndChild();
+    ImGui::SameLine(0.0f, column_gap);
+    ImGui::BeginChild("##launcher_right", ImVec2(0, 0), ImGuiChildFlags_None);
     ImGui::TextUnformatted("Graphics backend");
     if (ImGui::BeginCombo("##graphics_backend",
                           graphics_backends[graphics_backend_index].text))
@@ -1418,53 +1795,6 @@ int main(int argc, char** argv)
         config.show_fps_in_title = show_fps_in_title;
       }
     }
-    ImGui::Spacing();
-    ImGui::TextUnformatted("Controller profile");
-    const char* controller_preview = controller_index >= 0
-                                         ? controllers[controller_index].label.c_str()
-                                     : selected_controller.empty() ? "No SDL gamepad detected"
-                                                                   : selected_controller.c_str();
-    if (ImGui::BeginCombo("##controller", controller_preview))
-    {
-      for (std::size_t i = 0; i < controllers.size(); ++i)
-      {
-        const bool selected = controller_index == static_cast<int>(i);
-        if (ImGui::Selectable(controllers[i].label.c_str(), selected))
-        {
-          controller_index = static_cast<int>(i);
-          selected_controller = controllers[i].device;
-          controller_status =
-              controller_profile_exists
-                  ? "Existing " + std::string(CONTROLLER_PROFILE_NAME) + " unchanged"
-                  : "Ready to generate controller profile";
-        }
-        if (selected)
-          ImGui::SetItemDefaultFocus();
-      }
-      ImGui::EndCombo();
-    }
-    ImGui::BeginDisabled(controller_index < 0);
-    const std::string replace_profile =
-        "Replace with generated " + std::string(GENERATED_PROFILE_LABEL);
-    if (ImGui::Button(replace_profile.c_str()))
-      select_controller(controller_index);
-    ImGui::EndDisabled();
-    ImGui::Spacing();
-    ImGui::TextUnformatted("Netplay");
-    ImGui::SetNextItemWidth(220 * scale);
-    ImGui::InputText("Nickname", netplay_nickname.data(), netplay_nickname.size());
-    ImGui::SetNextItemWidth(220 * scale);
-    ImGui::InputText("Host / IP", netplay_address.data(), netplay_address.size());
-    ImGui::SetNextItemWidth(120 * scale);
-    ImGui::InputInt("UDP port", &netplay_port);
-    netplay_port = std::clamp(netplay_port, 1, 65535);
-    ImGui::Checkbox("Automatic input buffer", &automatic_buffer);
-    if (!automatic_buffer)
-    {
-      ImGui::SetNextItemWidth(180 * scale);
-      ImGui::SliderInt("Buffer frames", &manual_buffer, 1, 20);
-    }
-    ImGui::Spacing();
     ImGui::TextUnformatted("Game disc image");
     if (selected_image)
       ImGui::TextWrapped("%s", selected_image->string().c_str());
@@ -1501,6 +1831,7 @@ int main(int argc, char** argv)
       if (!dialog.error.empty())
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "%s", dialog.error.c_str());
     }
+    ImGui::EndChild();
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::TextWrapped("Controller: %s", controller_status.c_str());

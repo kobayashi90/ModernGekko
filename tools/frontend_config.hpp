@@ -41,7 +41,7 @@ struct ConfigResult {
   std::string audio_backend;
   std::string controller;
   std::vector<std::string> controllers;
-  bool show_fps_in_title = false;
+  bool show_fps_in_title = true;
   bool fullscreen = false;
   bool vsync = true;
   int volume = 100;
@@ -50,7 +50,9 @@ struct ConfigResult {
   // Read from the SRAM block at boot, so changing it needs a restart.
   std::string language = "English";
   // Aspect ratio mode value ("auto", "16:9", "4:3", "stretch", "raw").
-  std::string aspect_ratio = "auto";
+  // "stretch" fills a 16:9 window with the 4:3 picture, which is how the tuned
+  // profile was played and verified; the other modes leave letterbox bars.
+  std::string aspect_ratio = "stretch";
   bool widescreen_hack = false;
   // Frontend-drawn FPS pill (the title-bar counter is show_fps_in_title). The
   // menu paints this itself; Dolphin's GFX_SHOW_FPS overlay is never enabled.
