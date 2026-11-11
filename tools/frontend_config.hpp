@@ -41,6 +41,10 @@ struct ConfigResult {
   std::string audio_backend;
   std::string controller;
   std::vector<std::string> controllers;
+  // Compiler used to build the recompiled module when it has to be built on
+  // this machine. Empty means "pick automatically". It is stored as a path
+  // because a package may ship its own clang and a player may point at theirs.
+  std::string compiler;
   bool show_fps_in_title = true;
   bool fullscreen = false;
   bool vsync = true;

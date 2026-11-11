@@ -870,11 +870,16 @@ void ConfigMenu::Draw() {
   // scroll three rows of text in a box the size of a business card. The caps
   // keep it sane on a small window and stop it from becoming a full-screen
   // settings wall on a 4K one.
+  // The floors matter more than the fractions: the System tab (five info lines,
+  // language, region, the installed-version box and four buttons) needs ~560 px
+  // of height at font size 16, so a 1280x720 window must still get a 560 px
+  // panel instead of 0.62 x 720 = 446 px, which pushed the buttons out of the
+  // window -- the "the System tab makes it too small" complaint.
   const float width =
-      std::clamp(io.DisplaySize.x * 0.45f, 320.0f,
+      std::clamp(io.DisplaySize.x * 0.45f, 440.0f,
                  std::min(io.DisplaySize.x - 20.0f, 1180.0f));
   const float height =
-      std::clamp(io.DisplaySize.y * 0.60f, 280.0f,
+      std::clamp(std::max(io.DisplaySize.y * 0.62f, 560.0f), 280.0f,
                  std::min(io.DisplaySize.y - 20.0f, 820.0f));
   PushMenuStyle();
   ImGui::SetNextWindowPos(
@@ -1567,10 +1572,20 @@ std::filesystem::path FindModule(
   if (current_module.empty() ||
       current_module.filename().string() != current_name)
     return {};
-  const auto id_dir = current_module.parent_path().parent_path();
-  // Only walk further up if the shape really is <...>/<disc_id>/<hash>/<so>;
-  // a module sitting loose next to the executable has no region siblings.
-  if (id_dir.filename().string() != current_disc_id)
+  // Walk up to the directory named after the running disc id. Two shapes exist
+  // and both have to work: <root>/<disc id>/<hash>/<so>, and the on-demand
+  // layout <root>/<disc id>/<hash>/module-build/<so> -- the second is what the
+  // launcher produces, and stopping at a fixed depth made every other region
+  // read as "no module" when the running module came from a local build.
+  std::filesystem::path id_dir;
+  for (std::filesystem::path dir = current_module.parent_path();
+       !dir.empty() && !dir.filename().empty(); dir = dir.parent_path()) {
+    if (dir.filename().string() == current_disc_id) {
+      id_dir = dir;
+      break;
+    }
+  }
+  if (id_dir.empty())
     return {};
   const auto root = id_dir.parent_path();
   if (root.empty())
@@ -1588,6 +1603,10 @@ std::filesystem::path FindModule(
     const auto nested = it->path() / name;
     if (std::filesystem::is_regular_file(nested, ec))
       return nested;
+    // ... and the same one level deeper, for a module built in place.
+    const auto built = it->path() / "module-build" / name;
+    if (std::filesystem::is_regular_file(built, ec))
+      return built;
   }
   return {};
 }
@@ -1968,76 +1987,91 @@ void ConfigMenu::DrawSystemTab() {
     m_versions_scanned = false;
     m_install_images_scanned = false;
   }
-  // One bounded, scrollable box for both lists. Bounded because the tab has to
-  // stay inside the panel even with a dozen extractions, and a list that grows
-  // the window hides the buttons at the bottom (the bug this menu had before it
-  // was split into tabs); one box because two headings and two framed children
-  // cost more height than the tab has to spare.
-  const float versions_height =
-      ImGui::GetTextLineHeightWithSpacing() * 5.0f;
-  ImGui::BeginChild("##installed_versions", ImVec2(0.0f, versions_height),
-                    ImGuiChildFlags_Borders);
-  for (const auto &entry : m_versions) {
-    ImGui::PushID(entry.disc_id.c_str());
-    const bool running = entry.disc_id == m_hooks.disc_id;
-    const char region_letter =
-        entry.disc_id.size() == 6 ? entry.disc_id[3] : '?';
-    ImGui::Text("%s [%s - %s]", entry.name.c_str(), entry.disc_id.c_str(),
-                RegionLabel(region_letter).c_str());
-    ImGui::SameLine();
-    if (running) {
-      ImGui::TextDisabled("running");
-    } else if (entry.module.empty()) {
-      ImGui::TextDisabled("no module - build it in the launcher");
-    } else if (ImGui::SmallButton("Switch")) {
-      // Rect logged like every other actionable widget in this tab: the harness
-      // asserts controls fit the panel, and a click test needs the real
-      // coordinates instead of eyeballed ones.
-      std::lock_guard lock(m_region_mutex);
-      m_region_game_root = entry.game_root.string();
-      m_region_module = entry.module.string();
-      m_region_switch.store(true);
-      m_restart.store(true);
-      std::fprintf(stderr,
-                   "[menu] version switch requested: %s -> %s\n",
-                   m_hooks.disc_id.c_str(), entry.disc_id.c_str());
-      SetStatus("switching to " + entry.name + " (" + entry.disc_id + ")…");
-      if (m_runtime)
-        m_runtime->RequestStop();
+  // A table, not a scrolling child box: with two or three extractions (the
+  // normal case) a scrollbar was decoration that made the list look cut off, and
+  // the rows read better when the action column lines up.
+  if (ImGui::BeginTable("##installed_versions", 2,
+                        ImGuiTableFlags_SizingStretchProp |
+                            ImGuiTableFlags_RowBg)) {
+    ImGui::TableSetupColumn("Version", ImGuiTableColumnFlags_WidthStretch,
+                            0.70f);
+    ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch,
+                            0.30f);
+    for (const auto &entry : m_versions) {
+      ImGui::PushID(entry.disc_id.c_str());
+      const bool running = entry.disc_id == m_hooks.disc_id;
+      const char region_letter =
+          entry.disc_id.size() == 6 ? entry.disc_id[3] : '?';
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      ImGui::Text("%s [%s - %s]", entry.name.c_str(), entry.disc_id.c_str(),
+                  RegionLabel(region_letter).c_str());
+      ImGui::TableSetColumnIndex(1);
+      if (running) {
+        ImGui::TextDisabled("running");
+      } else if (entry.module.empty()) {
+        ImGui::TextDisabled("no module - build it in the launcher");
+      } else if (ImGui::SmallButton("Switch")) {
+        // Rect logged like every other actionable widget in this tab: the
+        // harness asserts controls fit the panel, and a click test needs the
+        // real coordinates instead of eyeballed ones.
+        std::lock_guard lock(m_region_mutex);
+        m_region_game_root = entry.game_root.string();
+        m_region_module = entry.module.string();
+        m_region_switch.store(true);
+        m_restart.store(true);
+        std::fprintf(stderr,
+                     "[menu] version switch requested: %s -> %s\n",
+                     m_hooks.disc_id.c_str(), entry.disc_id.c_str());
+        SetStatus("switching to " + entry.name + " (" + entry.disc_id + ")…");
+        if (m_runtime)
+          m_runtime->RequestStop();
+      }
+      if (!running && !entry.module.empty())
+        LogItemRect("widget", "switch-" + entry.disc_id);
+      ImGui::PopID();
     }
-    if (!running && !entry.module.empty())
-      LogItemRect("widget", "switch-" + entry.disc_id);
-    ImGui::PopID();
+    ImGui::EndTable();
   }
 
   // Installing needs Dolphin's disc reader, which only the launcher links, so
   // the row spawns the launcher's `--extract` mode in the background.
-  ImGui::Separator();
+  ImGui::Spacing();
+  ImGui::TextDisabled("Install another version");
   if (m_install && m_install->running.load()) {
     std::string image;
     {
       std::lock_guard lock(m_install->mutex);
       image = m_install->image;
     }
-    ImGui::TextDisabled("Extracting %s…", image.c_str());
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("Extracting %s…", image.c_str());
+    ImGui::PopStyleColor();
   } else {
     if (!m_install_images_scanned)
       ScanInstallImages();
     if (m_install_images.empty()) {
-      ImGui::TextDisabled("Install: no ISO, WBFS or RVZ in Documents.");
-    } else {
-      ImGui::TextDisabled("Install:");
+      ImGui::TextDisabled("No ISO, WBFS or RVZ found in Documents or Downloads.");
+    } else if (ImGui::BeginTable("##install_images", 2,
+                                 ImGuiTableFlags_SizingStretchProp |
+                                     ImGuiTableFlags_RowBg)) {
+      ImGui::TableSetupColumn("Image", ImGuiTableColumnFlags_WidthStretch,
+                              0.70f);
+      ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch,
+                              0.30f);
       for (const auto &image : m_install_images) {
         ImGui::PushID(image.string().c_str());
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
         ImGui::TextUnformatted(image.filename().string().c_str());
-        ImGui::SameLine();
+        ImGui::TableSetColumnIndex(1);
         if (ImGui::SmallButton("Extract"))
           InstallVersion(image);
         ImGui::PopID();
       }
+      ImGui::EndTable();
     }
   }
-  ImGui::EndChild();
 
   ImGui::Spacing();
   ImGui::Separator();

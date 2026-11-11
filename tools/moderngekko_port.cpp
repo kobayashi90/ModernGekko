@@ -608,24 +608,62 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
     return std::nullopt;
   }
 
+  // "family" picks the flag set, "compiler" is what actually runs. They differ
+  // whenever the caller names an executable: a shipped llvm-mingw clang.exe must
+  // be driven with clang flags, not because its name got compared against the
+  // literal "clang", but because of the family derived here.
+  std::string family;
   std::string compiler;
-  if (options.toolchain == "auto")
+  if (!options.compiler.empty())
+  {
+    compiler = options.compiler;
+    std::string stem = fs::path(compiler).stem().string();
+    std::transform(stem.begin(), stem.end(), stem.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (stem.find("clang") != std::string::npos)
+      family = "clang";
+    else if (stem == "cl" || stem == "clang-cl" || stem.rfind("cl-", 0) == 0)
+      family = "msvc";
+    else if (stem.find("gcc") != std::string::npos ||
+             stem.find("g++") != std::string::npos || stem == "cc" ||
+             stem == "c++")
+      family = "gcc";
+    else
+    {
+      std::cerr << "compiler is not a known C compiler: " << compiler << '\n'
+                << "expected a clang, gcc/cc or cl executable\n";
+      return std::nullopt;
+    }
+#if !defined(_WIN32)
+    if (family == "msvc")
+    {
+      std::cerr << "MSVC modules can only be built on Windows\n";
+      return std::nullopt;
+    }
+#endif
+  }
+  else if (options.toolchain == "auto")
+  {
 #if defined(_MSC_VER)
+    family = "msvc";
     compiler = "cl";
 #elif defined(__clang__)
-    compiler = "clang";
+    family = compiler = "clang";
 #elif defined(__GNUC__)
-    compiler = "gcc";
+    family = compiler = "gcc";
 #else
-    compiler = ReadCommand("clang --version 2>&1").empty() ? "gcc" : "clang";
+    family = ReadCommand("clang --version 2>&1").empty() ? "gcc" : "clang";
+    compiler = family;
 #endif
-  else if (options.toolchain == "clang")
-    compiler = "clang";
-  else if (options.toolchain == "gcc")
-    compiler = "gcc";
+  }
+  else if (options.toolchain == "clang" || options.toolchain == "gcc")
+  {
+    family = compiler = options.toolchain;
+  }
   else if (options.toolchain == "msvc")
   {
 #if defined(_WIN32)
+    family = "msvc";
     compiler = "cl";
 #else
     std::cerr << "MSVC modules can only be built on Windows\n";
@@ -638,7 +676,12 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
     return std::nullopt;
   }
 
-  const std::string compiler_identity = ReadCommand(compiler + " --version 2>&1");
+  // Probe with the path quoted: a shipped compiler lives under a directory with
+  // spaces ("C:\Program Files\...") often enough that an unquoted popen
+  // command silently returns nothing, which used to read as "compiler is
+  // unavailable" on a machine where the compiler was right there.
+  const std::string compiler_identity =
+      ReadCommand(Quote(compiler) + " --version 2>&1");
   if (compiler_identity.empty())
   {
     std::cerr << "compiler is unavailable: " << compiler << '\n';
@@ -660,20 +703,41 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
 #endif
   const std::string opt = options.opt_level.empty() ? std::string("2") : options.opt_level;
   std::string flags;
-  if (compiler == "clang")
+  if (family == "clang")
   {
+    // -O2 is the level these modules are tuned and verified at; everything
+    // else here is the "and the rest of the optimisations" half. The two FP
+    // flags stay: the emulated CPU's FPSCR bits are computed in software, so
+    // host fast-math and FMA contraction would only change results, not speed
+    // anything that matters. -fno-math-errno and
+    // -fno-semantic-interposition are pure wins under -fvisibility=hidden
+    // (math calls stop anding in errno, and the compiler may inline across
+    // translation units it already knows cannot be interposed).
     flags = "compile:-O" + opt +
             (options.no_lto ? "" : " -flto=thin") +
-            " -fvisibility=hidden -ffp-contract=off -fno-fast-math" +
+            " -fvisibility=hidden -ffp-contract=off -fno-fast-math"
+            " -fno-math-errno -fno-semantic-interposition" +
             (options.no_lto ? " link:no-lto" : " link:-flto=thin");
 #if defined(__linux__)
     flags += " -fuse-ld=lld";
 #endif
+#if defined(_WIN32)
+    // A mingw-target clang on Windows, linking against an MSVC-built runner.
+    // Without -static the DLL depends on libgcc_s_seh-1.dll, libstdc++-6.dll and
+    // libwinpthread-1.dll, which the package does not carry: the module then
+    // fails to load with "the specified module could not be found", which reads
+    // like a bad disc rather than a missing runtime. Static linking also keeps
+    // the C++ runtime out of the process twice.
+    // Link side only: -static makes ld prefer the static mingw runtimes, so the
+    // DLL carries no libgcc/libstdc++/libwinpthread dependency.
+    flags += " link:-static -static-libgcc";
+#endif
   }
-  else if (compiler == "gcc")
+  else if (family == "gcc")
   {
     flags = "compile:-O" + opt +
-            " -fvisibility=hidden -ffp-contract=off -fno-fast-math link:no-lto";
+            " -fvisibility=hidden -ffp-contract=off -fno-fast-math"
+            " -fno-math-errno -fno-semantic-interposition link:no-lto";
   }
   else
   {

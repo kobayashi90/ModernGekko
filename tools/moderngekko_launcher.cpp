@@ -806,10 +806,106 @@ bool UseBundledToolchain(const fs::path& install_dir)
   return true;
 }
 
+// A compiler the module build can actually use, and the version line that
+// proves it. A package that ships its own clang used to be trusted blindly: the
+// build started, failed twenty seconds later in CMake, and the player had no way
+// to tell a broken toolchain from a broken disc. Probing first turns that into a
+// named problem with a fix ("pick another compiler") before the build runs.
+struct CompilerProbe
+{
+  fs::path path;
+  std::string version;
+  std::string error;
+  bool ok() const { return !version.empty(); }
+};
+
+CompilerProbe ProbeCompiler(const fs::path& compiler)
+{
+  CompilerProbe probe;
+  probe.path = compiler;
+  if (compiler.empty())
+  {
+    probe.error = "no compiler chosen";
+    return probe;
+  }
+  std::error_code ec;
+  const fs::path output = fs::temp_directory_path(ec) / "moderngekko-compiler-probe.txt";
+  if (ec)
+  {
+    probe.error = "no temporary directory to probe the compiler in";
+    return probe;
+  }
+  SDL_IOStream* log = SDL_IOFromFile(output.string().c_str(), "w");
+  if (!log)
+  {
+    probe.error = "cannot write " + output.string();
+    return probe;
+  }
+  // SDL_CreateProcess instead of a shell: a path with spaces ("C:\Program
+  // Files\...") or a missing file then shows up as an error string instead of
+  // an empty read that looks like "the compiler is not installed".
+  std::vector<std::string> storage = {compiler.string(), "--version"};
+  std::vector<const char*> arguments;
+  arguments.reserve(storage.size() + 1);
+  for (const std::string& argument : storage)
+    arguments.push_back(argument.c_str());
+  arguments.push_back(nullptr);
+  SDL_PropertiesID properties = SDL_CreateProperties();
+  SDL_SetPointerProperty(properties, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, arguments.data());
+  SDL_SetNumberProperty(properties, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER, SDL_PROCESS_STDIO_REDIRECT);
+  SDL_SetPointerProperty(properties, SDL_PROP_PROCESS_CREATE_STDOUT_POINTER, log);
+  SDL_SetBooleanProperty(properties, SDL_PROP_PROCESS_CREATE_STDERR_TO_STDOUT_BOOLEAN, true);
+  SDL_Process* process = SDL_CreateProcessWithProperties(properties);
+  SDL_DestroyProperties(properties);
+  SDL_CloseIO(log);
+  if (!process)
+  {
+    probe.error = "cannot run " + compiler.string() + ": " + SDL_GetError();
+    return probe;
+  }
+  int exit_code = 1;
+  SDL_WaitProcess(process, true, &exit_code);
+  SDL_DestroyProcess(process);
+
+  std::ifstream version_file(output);
+  std::string line;
+  while (std::getline(version_file, line))
+  {
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+      line.pop_back();
+    if (line.empty())
+      continue;
+    probe.version = line;
+    break;
+  }
+  fs::remove(output, ec);
+  if (probe.version.empty())
+    probe.error = compiler.string() + " did not report a version (exit " +
+                  std::to_string(exit_code) + ")";
+  return probe;
+}
+
+// The compiler a package ships, if any. llvm-mingw is the Windows bundle; the
+// other paths cover a Linux/macOS bundle built the same way.
+fs::path BundledCompiler(const fs::path& install_dir)
+{
+  std::error_code ec;
+  for (const char* relative : {"Toolchain/mingw/bin/clang", "Toolchain/bin/clang"})
+  {
+    fs::path candidate = install_dir / relative;
+#if defined(_WIN32)
+    candidate += ".exe";
+#endif
+    if (fs::is_regular_file(candidate, ec))
+      return candidate;
+  }
+  return {};
+}
+
 bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
                          const fs::path& work_dir, const fs::path& final_path,
                          const fs::path& log_path, bool bundled_toolchain,
-                         std::string* error)
+                         const std::string& compiler, std::string* error)
 {
   std::error_code ec;
   fs::create_directories(work_dir, ec);
@@ -824,9 +920,10 @@ bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
   // --output is the artifact *directory*: the tool puts the library under
   // <dir>/<disc>/<dol-hash>/, so it is moved into place afterwards.
   // Optimisation matters here: this build produces the binary the player
-  // actually runs. -O3 is the same level the tuned builds use, and it is what
-  // the default -O2 was silently costing (the installer-built module ran well
-  // below the tuned one, which showed up as a slow intro).
+  // actually runs. -O2 is the level the tuned builds were measured at, with
+  // ThinLTO on Linux/macOS and the extra FP-safe passes moderngekko-port adds;
+  // -O3 only ever looked faster because the flags were not what they claimed
+  // to be.
   std::vector<std::string> storage = {port_tool.string(), "build", game_root.string(),
                                       "--output", work_dir.string(), "--opt-level", "2"};
 #if defined(_WIN32)
@@ -835,9 +932,16 @@ bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
   // real frame time.
   storage.emplace_back("--no-lto");
 #endif
-  // A MSVC-built port defaults to `cl` for "auto"; when the package ships its
-  // own clang and the machine has no Visual Studio, name the compiler instead.
-  if (bundled_toolchain)
+  // The exact compiler that was probed in the launcher. Passing the path makes
+  // the build independent of PATH order: on Windows the bundle used to be found
+  // only because its directory was prepended to PATH, and a system clang in a
+  // different bitness or a bare `cl` would win as soon as that prefix was wrong.
+  if (!compiler.empty())
+  {
+    storage.emplace_back("--compiler");
+    storage.emplace_back(compiler);
+  }
+  else if (bundled_toolchain)
   {
     storage.emplace_back("--toolchain");
     storage.emplace_back("clang");

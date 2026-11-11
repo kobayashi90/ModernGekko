@@ -14,6 +14,11 @@ namespace fs = std::filesystem;
 struct BuildOptions
 {
   std::string toolchain = "auto";
+  // Explicit compiler executable (or a bare name on PATH). The launcher probes
+  // the compiler it is about to use and passes the exact path, so a package that
+  // ships its own clang does not depend on PATH resolution order and a player
+  // who points at their own compiler gets that one instead.
+  std::string compiler;
   std::string opt_level;
   std::string backend;
   fs::path output;
@@ -82,6 +87,8 @@ inline CommandLine ParseCommandLine(int argc, const char* const* argv,
       runner_arguments = true;
     else if (argument == "--toolchain" && i + 1 < argc)
       parsed.build.toolchain = argv[++i];
+    else if (argument == "--compiler" && i + 1 < argc)
+      parsed.build.compiler = argv[++i];
     else if (argument == "--backend" && i + 1 < argc)
       parsed.build.backend = argv[++i];
     else if (argument == "--opt-level" && i + 1 < argc)

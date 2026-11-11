@@ -175,6 +175,8 @@ ConfigResult LoadConfig(const fs::path &user_directory,
     }
     else if (key == "controller")
       config.controller = raw_value;
+    else if (key == "compiler")
+      config.compiler = raw_value;
     else if (key.starts_with("controller") && key.size() == 11 &&
              key.back() >= '1' && key.back() <= '4') {
       const std::size_t index = static_cast<std::size_t>(key.back() - '1');
@@ -394,8 +396,13 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
        << "[Audio]\n"
        << "audio_backend=" << config.audio_backend << '\n'
        << "volume=" << config.volume << '\n'
-       << "mute=" << (config.mute ? "true" : "false") << '\n'
-       << "[Input]\n";
+       << "mute=" << (config.mute ? "true" : "false") << '\n';
+  // Its own section: it is a build setting, and the [Input] block below is a
+  // list of controllerN= keys. Omitted entirely when nothing was chosen, so a
+  // default install's config stays the documented set.
+  if (!config.compiler.empty())
+    file << "[Build]\n" << "compiler=" << config.compiler << '\n';
+  file << "[Input]\n";
   for (std::size_t i = 0; i < config.controllers.size() && i < 4; ++i) {
     if (config.controllers[i].find_first_of("\r\n") != std::string::npos) {
       if (error)
