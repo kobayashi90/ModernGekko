@@ -2226,8 +2226,16 @@ int main(int argc, char** argv)
           ImVec2(gate_viewport->GetCenter().x, gate_viewport->GetCenter().y),
           ImGuiCond_Always, ImVec2(0.5f, 0.5f));
       ImGui::SetNextWindowSize(ImVec2(680 * scale, 0), ImGuiCond_Always);
+      // The gate is a dialog over the launcher, not a second window beside it.
+      // The launcher window is full-viewport and holds focus (the player just
+      // clicked Play in it), and ImGui draws the focused window last, so the
+      // gate ended up *behind* the very window that opened it. Taking focus
+      // every frame while it is open keeps it on top -- and makes the dim
+      // behind it honest, because the launcher is no longer clickable anyway.
+      ImGui::SetNextWindowFocus();
       ImGui::Begin("Recompiled game module", nullptr,
-                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize |
+                       ImGuiWindowFlags_NoSavedSettings);
       switch (gate)
       {
       case ModuleGate::Ask:
