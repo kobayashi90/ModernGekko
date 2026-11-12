@@ -147,6 +147,36 @@ std::string Narrow(std::wstring_view wide)
 }
 #endif
 
+// Windows 8.3 short form of a path.
+//
+// CMake writes the compiler into build.ninja *unquoted*, and ninja runs the
+// build lines through `cmd /C`. A path containing '(' -- and Windows/browsers
+// add those routinely when a download already exists, e.g.
+// "Downloads\\BeachSpikers-Windows(1)" -- is then parsed as a cmd subshell, so
+// every compile fails with "not recognized as an internal or external command".
+// Feeding CMake the short form (C:\\Users\\SHADOW~1\\...) sidesteps quoting
+// rules entirely. If 8.3 names are disabled on the volume the original path is
+// returned unchanged and the old behaviour (broken only for such paths) stays.
+std::string ShortPathForWindows(const std::string& path)
+{
+#if defined(_WIN32)
+  if (path.find('(') == std::string::npos && path.find(' ') == std::string::npos)
+    return path;
+  const std::wstring wide = Widen(path);
+  const DWORD needed = GetShortPathNameW(wide.c_str(), nullptr, 0);
+  if (needed == 0)
+    return path;
+  std::wstring buffer(needed, L'\0');
+  const DWORD written = GetShortPathNameW(wide.c_str(), buffer.data(), needed);
+  if (written == 0 || written >= needed)
+    return path;
+  buffer.resize(written);
+  return Narrow(buffer);
+#else
+  return path;
+#endif
+}
+
 class ScopedEnvironment
 {
 public:
@@ -883,17 +913,22 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
     std::ofstream{normalized_smc};
 
   const unsigned compile_jobs = std::max(1u, std::thread::hardware_concurrency());
+  // CMake embeds these paths in build.ninja without quoting: hand it the 8.3
+  // form so a package unpacked into "...-Windows(1)" still builds.
+  const std::string cmake_compiler = ShortPathForWindows(compiler);
+  const std::string cmake_ninja =
+      options.ninja.empty() ? std::string() : ShortPathForWindows(options.ninja);
   std::string configure = "cmake -E env CMAKE_NINJA_FORCE_RESPONSE_FILE=1 cmake -S " +
       Quote(source_root / "module-template") +
       " -B " + Quote(module_build) + " -G Ninja -DCMAKE_BUILD_TYPE=Release" +
       // Quoted: a Windows install path routinely contains spaces and
       // parentheses ("BeachSpikers-Windows(1)"), and cmd.exe treats both as
       // syntax rather than part of an argument.
-      " -DCMAKE_C_COMPILER=" + QuoteText(moderngekko::pgo::PathText(compiler)) +
-      (options.ninja.empty() ?
+      " -DCMAKE_C_COMPILER=" + QuoteText(moderngekko::pgo::PathText(cmake_compiler)) +
+      (cmake_ninja.empty() ?
            std::string() :
            " -DCMAKE_MAKE_PROGRAM=" +
-               QuoteText(moderngekko::pgo::PathText(options.ninja))) +
+               QuoteText(moderngekko::pgo::PathText(cmake_ninja))) +
       " -DGAME_ID=" + game.disc_id +
       " -DGENERATED_DIR=" + Quote(generated) +
       " -DGXRUNTIME_DIR=" + Quote(source_root / "GXRuntime") +
