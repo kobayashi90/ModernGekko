@@ -1439,6 +1439,40 @@ int main(int argc, char** argv)
   const fs::path port_tool = SiblingTool(argv[0], "moderngekko-port");
   const fs::path modules_dir = user_directory / "StaticRecompModules";
 
+  // Which compiler the on-demand module build will use, and what it says about
+  // itself. Resolved once at startup: the shipped clang first (so a package is
+  // self-contained), then whatever config.ini remembers, then the system
+  // compiler. Empty means the gate reports the problem instead of starting a
+  // build that fails at unit 1.
+  std::string compiler_path;
+  std::string compiler_version;
+  {
+    std::vector<fs::path> candidates;
+    if (!config.compiler.empty())
+      candidates.emplace_back(config.compiler);
+    if (const fs::path bundled = BundledCompiler(exe_dir); !bundled.empty())
+      candidates.push_back(bundled);
+#if defined(_WIN32)
+    candidates.emplace_back("cl");
+#endif
+    candidates.emplace_back("clang");
+    candidates.emplace_back("gcc");
+    for (const fs::path& candidate : candidates)
+    {
+      const CompilerProbe probe = ProbeCompiler(candidate);
+      if (probe.ok())
+      {
+        compiler_path = candidate.string();
+        compiler_version = probe.version;
+        break;
+      }
+      LauncherLog("compiler rejected: %s", probe.error.c_str());
+    }
+    LauncherLog("module build compiler: %s (%s)",
+                compiler_path.empty() ? "none" : compiler_path.c_str(),
+                compiler_version.empty() ? "-" : compiler_version.c_str());
+  }
+
   auto module_suffix = []()
   {
 #if defined(_WIN32)
@@ -2157,7 +2191,7 @@ int main(int argc, char** argv)
               {
                 std::string error;
                 const bool ok = BuildModuleFromDisc(port_tool, current_game, work_dir, output,
-                                                    log_path, bundled, &error);
+                                                    log_path, bundled, compiler_path, &error);
                 build_error = std::move(error);
                 build_ok.store(ok);
                 build_done.store(true);
@@ -2199,7 +2233,7 @@ int main(int argc, char** argv)
                 {
                   std::string error;
                   const bool ok = BuildModuleFromDisc(port_tool, current_game, work_dir, output,
-                                                      log_path, bundled, &error);
+                                                      log_path, bundled, compiler_path, &error);
                   build_error = std::move(error);
                   build_ok.store(ok);
                   build_done.store(true);
@@ -2209,7 +2243,18 @@ int main(int argc, char** argv)
           if (ImGui::Button("Cancel", ImVec2(120 * scale, 36 * scale)))
             gate = ModuleGate::None;
           ImGui::Spacing();
-          ImGui::TextDisabled("Needs a compiler: bundled for Windows, gcc/clang elsewhere.");
+          if (compiler_version.empty())
+          {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                               "No usable C compiler was found, so the build cannot "
+                               "start. Put a clang/gcc on PATH, or point config.ini's "
+                               "[Build] compiler= at one.");
+          }
+          else
+          {
+            ImGui::TextDisabled("Compiler: %s", compiler_version.c_str());
+            ImGui::TextDisabled("%s", compiler_path.c_str());
+          }
         }
         break;
       }
