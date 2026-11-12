@@ -10,6 +10,12 @@ include(CheckIncludeFileCXX)
 
 if(WIN32)
     set(MODERNGEKKO_DYNAMIC_MODULES_DEFAULT ON)
+    # mingw-w64 defaults to _WIN32_WINNT=0x0601 (Windows 7) and therefore hides
+    # every post-7 declaration, while MSVC picks up the SDK's "everything". That
+    # asymmetry is what made Serial/Timer code fail to compile under llvm-mingw
+    # ("SetProcessInformation" exists in its headers, but only above 0x0602).
+    # One project-wide floor keeps both toolchains seeing the same API surface.
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000000)
 else()
     check_include_file_cxx(dlfcn.h MODERNGEKKO_HAS_DLFCN)
     set(MODERNGEKKO_DYNAMIC_MODULES_DEFAULT ${MODERNGEKKO_HAS_DLFCN})
