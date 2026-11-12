@@ -25,6 +25,10 @@ struct BuildOptions
   // build program corresponding to Ninja", which is what a shipped Windows
   // package hit on its first real run.
   std::string ninja;
+  // Python for the module template's ABI table generation. Passed to CMake as
+  // Python3_EXECUTABLE for the same reason ninja is pinned: a packaged Python
+  // has to be reachable without relying on PATH surviving into a grandchild.
+  std::string python;
   std::string opt_level;
   std::string backend;
   fs::path output;
@@ -97,6 +101,8 @@ inline CommandLine ParseCommandLine(int argc, const char* const* argv,
       parsed.build.compiler = argv[++i];
     else if (argument == "--ninja" && i + 1 < argc)
       parsed.build.ninja = argv[++i];
+    else if (argument == "--python" && i + 1 < argc)
+      parsed.build.python = argv[++i];
     else if (argument == "--backend" && i + 1 < argc)
       parsed.build.backend = argv[++i];
     else if (argument == "--opt-level" && i + 1 < argc)

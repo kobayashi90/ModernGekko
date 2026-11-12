@@ -924,7 +924,7 @@ bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
                          const fs::path& work_dir, const fs::path& final_path,
                          const fs::path& log_path, bool bundled_toolchain,
                          const std::string& compiler, const std::string& ninja,
-                         std::string* error)
+                         const std::string& python, std::string* error)
 {
   std::error_code ec;
   fs::create_directories(work_dir, ec);
@@ -962,6 +962,11 @@ bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
   {
     storage.emplace_back("--ninja");
     storage.emplace_back(ninja);
+  }
+  if (!python.empty())
+  {
+    storage.emplace_back("--python");
+    storage.emplace_back(python);
   }
   if (!compiler.empty())
   {
@@ -1531,6 +1536,38 @@ int main(int argc, char** argv)
       break;
     }
     LauncherLog("module build ninja: %s", ninja_path.empty() ? "none" : ninja_path.c_str());
+  }
+
+  // Python: the module template generates its ABI tables with a Python script,
+  // so a packaged interpreter has to be found even if PATH does not carry it.
+  std::string python_path;
+  {
+    std::vector<fs::path> candidates;
+#if defined(_WIN32)
+    candidates.push_back(exe_dir / "Toolchain" / "python" / "python.exe");
+#else
+    candidates.push_back(exe_dir / "Toolchain" / "python" / "bin" / "python3");
+#endif
+    for (const char* name : {"python3", "python"})
+    {
+      const fs::path sibling = SiblingTool(argv[0], name);
+      if (!sibling.empty())
+        candidates.push_back(sibling);
+    }
+    candidates.emplace_back("python3");
+    candidates.emplace_back("python");
+    for (const fs::path& candidate : candidates)
+    {
+      if (candidate.has_parent_path())
+      {
+        std::error_code type_error;
+        if (!fs::is_regular_file(candidate, type_error))
+          continue;
+      }
+      python_path = candidate.string();
+      break;
+    }
+    LauncherLog("module build python: %s", python_path.empty() ? "none" : python_path.c_str());
   }
 
   auto module_suffix = []()
@@ -2260,7 +2297,7 @@ int main(int argc, char** argv)
                 std::string error;
                 const bool ok = BuildModuleFromDisc(port_tool, current_game, work_dir, output,
                                                     log_path, bundled, compiler_path,
-                                                    ninja_path, &error);
+                                                    ninja_path, python_path, &error);
                 build_error = std::move(error);
                 build_ok.store(ok);
                 build_done.store(true);
@@ -2303,7 +2340,7 @@ int main(int argc, char** argv)
                   std::string error;
                   const bool ok = BuildModuleFromDisc(port_tool, current_game, work_dir, output,
                                                       log_path, bundled, compiler_path,
-                                                      ninja_path, &error);
+                                                      ninja_path, python_path, &error);
                   build_error = std::move(error);
                   build_ok.store(ok);
                   build_done.store(true);

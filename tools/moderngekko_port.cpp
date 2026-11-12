@@ -918,6 +918,8 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   const std::string cmake_compiler = ShortPathForWindows(compiler);
   const std::string cmake_ninja =
       options.ninja.empty() ? std::string() : ShortPathForWindows(options.ninja);
+  const std::string cmake_python =
+      options.python.empty() ? std::string() : ShortPathForWindows(options.python);
   std::string configure = "cmake -E env CMAKE_NINJA_FORCE_RESPONSE_FILE=1 cmake -S " +
       Quote(source_root / "module-template") +
       " -B " + Quote(module_build) + " -G Ninja -DCMAKE_BUILD_TYPE=Release" +
@@ -929,6 +931,10 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
            std::string() :
            " -DCMAKE_MAKE_PROGRAM=" +
                QuoteText(moderngekko::pgo::PathText(cmake_ninja))) +
+      (cmake_python.empty() ?
+           std::string() :
+           " -DPython3_EXECUTABLE=" +
+               QuoteText(moderngekko::pgo::PathText(cmake_python))) +
       " -DGAME_ID=" + game.disc_id +
       " -DGENERATED_DIR=" + Quote(generated) +
       " -DGXRUNTIME_DIR=" + Quote(source_root / "GXRuntime") +
