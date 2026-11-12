@@ -17,19 +17,14 @@ if(WIN32)
     # One project-wide floor keeps both toolchains seeing the same API surface.
     add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000000)
     if(NOT MSVC)
-        # The vendored Dolphin headers rely on transitive includes that MSVC's
-        # STL happens to provide (std::vector in CustomTextureData.h is the one
-        # that broke a mingw build first). Carrying a prelude is the honest
-        # version of "this tree was written against MSVC": it keeps the vendor
-        # code untouched and does not turn every rebuild into a missing-include
-        # hunt through hundreds of files we do not own.
-        # C++ only: these are C++ headers, and the tree also builds plain C
-        # (mbedtls), where "-include cstddef" is a hard error.
-        foreach(_mg_prelude cstddef cstdint vector string array optional functional
-                memory mutex limits algorithm chrono map set tuple span utility)
-            add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-include>")
-            add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${_mg_prelude}>")
-        endforeach()
+        # One prelude header, forced into every C++ translation unit: the vendored
+        # Dolphin sources rely on includes that MSVC's STL provides transitively
+        # (std::vector in CustomTextureData.h broke the first mingw build). Put on
+        # CMAKE_CXX_FLAGS rather than add_compile_options so the flag and its
+        # argument stay together -- split genex arguments were reordered and the
+        # headers ended up as input files.
+        string(APPEND CMAKE_CXX_FLAGS
+               " -include ${CMAKE_CURRENT_SOURCE_DIR}/cmake/mingw_prelude.hpp")
     endif()
 else()
     check_include_file_cxx(dlfcn.h MODERNGEKKO_HAS_DLFCN)
