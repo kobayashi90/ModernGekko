@@ -19,6 +19,12 @@ struct BuildOptions
   // ships its own clang does not depend on PATH resolution order and a player
   // who points at their own compiler gets that one instead.
   std::string compiler;
+  // Explicit Ninja (or any build program). CMake otherwise searches PATH, and
+  // on Windows the bundled Toolchain/bin entry does not always survive into the
+  // child's environment block -- configure then fails with "unable to find a
+  // build program corresponding to Ninja", which is what a shipped Windows
+  // package hit on its first real run.
+  std::string ninja;
   std::string opt_level;
   std::string backend;
   fs::path output;
@@ -89,6 +95,8 @@ inline CommandLine ParseCommandLine(int argc, const char* const* argv,
       parsed.build.toolchain = argv[++i];
     else if (argument == "--compiler" && i + 1 < argc)
       parsed.build.compiler = argv[++i];
+    else if (argument == "--ninja" && i + 1 < argc)
+      parsed.build.ninja = argv[++i];
     else if (argument == "--backend" && i + 1 < argc)
       parsed.build.backend = argv[++i];
     else if (argument == "--opt-level" && i + 1 < argc)

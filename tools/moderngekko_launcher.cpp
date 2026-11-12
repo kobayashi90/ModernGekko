@@ -789,8 +789,26 @@ bool UseBundledToolchain(const fs::path& install_dir)
     prefix += dir.string();
     prefix += separator;
   }
+#if defined(_WIN32)
+  // Read the real process block, not the CRT copy: SetEnvironmentVariableA on a
+  // name the block already spells differently ("Path" vs "PATH") can add a
+  // second entry instead of replacing the first, and the child then resolves
+  // tools against the old value -- which is how a packaged build ended up unable
+  // to find the bundled ninja.
+  std::string existing_value;
+  const DWORD needed = GetEnvironmentVariableA(variable, nullptr, 0);
+  if (needed > 0)
+  {
+    std::vector<char> buffer(needed);
+    const DWORD copied = GetEnvironmentVariableA(variable, buffer.data(), needed);
+    if (copied > 0 && copied < needed)
+      existing_value.assign(buffer.data(), copied);
+  }
+  const std::string combined = prefix + existing_value;
+#else
   const char* const existing = std::getenv(variable);
   const std::string combined = prefix + (existing ? existing : "");
+#endif
 #if defined(_WIN32)
   // _putenv_s only updates the CRT's copy of the environment; child processes
   // inherit the Win32 process block, which needs SetEnvironmentVariable. With
@@ -905,7 +923,8 @@ fs::path BundledCompiler(const fs::path& install_dir)
 bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
                          const fs::path& work_dir, const fs::path& final_path,
                          const fs::path& log_path, bool bundled_toolchain,
-                         const std::string& compiler, std::string* error)
+                         const std::string& compiler, const std::string& ninja,
+                         std::string* error)
 {
   std::error_code ec;
   fs::create_directories(work_dir, ec);
@@ -936,6 +955,14 @@ bool BuildModuleFromDisc(const fs::path& port_tool, const fs::path& game_root,
   // the build independent of PATH order: on Windows the bundle used to be found
   // only because its directory was prepended to PATH, and a system clang in a
   // different bitness or a bare `cl` would win as soon as that prefix was wrong.
+  // Pin the build program too: CMake only searches PATH for it, and the
+  // packaged Windows toolchain is exactly the case where that search came up
+  // empty ("unable to find a build program corresponding to Ninja").
+  if (!ninja.empty())
+  {
+    storage.emplace_back("--ninja");
+    storage.emplace_back(ninja);
+  }
   if (!compiler.empty())
   {
     storage.emplace_back("--compiler");
@@ -1471,6 +1498,39 @@ int main(int argc, char** argv)
     LauncherLog("module build compiler: %s (%s)",
                 compiler_path.empty() ? "none" : compiler_path.c_str(),
                 compiler_version.empty() ? "-" : compiler_version.c_str());
+  }
+
+  // Build program for the module build, for the same reason the compiler is
+  // resolved here: a bundled toolchain must not depend on PATH surviving into a
+  // grandchild process.
+  std::string ninja_path;
+  {
+    std::vector<fs::path> candidates;
+#if defined(_WIN32)
+    const fs::path bundled_ninja = exe_dir / "Toolchain" / "bin" / "ninja.exe";
+#else
+    const fs::path bundled_ninja = exe_dir / "Toolchain" / "bin" / "ninja";
+#endif
+    std::error_code bundled_error;
+    if (fs::is_regular_file(bundled_ninja, bundled_error))
+      candidates.push_back(bundled_ninja);
+    if (const fs::path sibling = SiblingTool(argv[0], "ninja"); !sibling.empty())
+      candidates.push_back(sibling);
+    candidates.emplace_back("ninja");
+    for (const fs::path& candidate : candidates)
+    {
+      // A bare name is accepted as-is: the port hands it to CMake, which
+      // resolves it, and that is the normal case on Linux/macOS.
+      if (candidate.has_parent_path())
+      {
+        std::error_code type_error;
+        if (!fs::is_regular_file(candidate, type_error))
+          continue;
+      }
+      ninja_path = candidate.string();
+      break;
+    }
+    LauncherLog("module build ninja: %s", ninja_path.empty() ? "none" : ninja_path.c_str());
   }
 
   auto module_suffix = []()
@@ -2191,7 +2251,8 @@ int main(int argc, char** argv)
               {
                 std::string error;
                 const bool ok = BuildModuleFromDisc(port_tool, current_game, work_dir, output,
-                                                    log_path, bundled, compiler_path, &error);
+                                                    log_path, bundled, compiler_path,
+                                                    ninja_path, &error);
                 build_error = std::move(error);
                 build_ok.store(ok);
                 build_done.store(true);
@@ -2233,7 +2294,8 @@ int main(int argc, char** argv)
                 {
                   std::string error;
                   const bool ok = BuildModuleFromDisc(port_tool, current_game, work_dir, output,
-                                                      log_path, bundled, compiler_path, &error);
+                                                      log_path, bundled, compiler_path,
+                                                      ninja_path, &error);
                   build_error = std::move(error);
                   build_ok.store(ok);
                   build_done.store(true);

@@ -886,7 +886,15 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   std::string configure = "cmake -E env CMAKE_NINJA_FORCE_RESPONSE_FILE=1 cmake -S " +
       Quote(source_root / "module-template") +
       " -B " + Quote(module_build) + " -G Ninja -DCMAKE_BUILD_TYPE=Release" +
-      " -DCMAKE_C_COMPILER=" + compiler + " -DGAME_ID=" + game.disc_id +
+      // Quoted: a Windows install path routinely contains spaces and
+      // parentheses ("BeachSpikers-Windows(1)"), and cmd.exe treats both as
+      // syntax rather than part of an argument.
+      " -DCMAKE_C_COMPILER=" + QuoteText(moderngekko::pgo::PathText(compiler)) +
+      (options.ninja.empty() ?
+           std::string() :
+           " -DCMAKE_MAKE_PROGRAM=" +
+               QuoteText(moderngekko::pgo::PathText(options.ninja))) +
+      " -DGAME_ID=" + game.disc_id +
       " -DGENERATED_DIR=" + Quote(generated) +
       " -DGXRUNTIME_DIR=" + Quote(source_root / "GXRuntime") +
       (options.opt_level.empty()
