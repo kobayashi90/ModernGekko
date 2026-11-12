@@ -23,9 +23,12 @@ if(WIN32)
         # version of "this tree was written against MSVC": it keeps the vendor
         # code untouched and does not turn every rebuild into a missing-include
         # hunt through hundreds of files we do not own.
+        # C++ only: these are C++ headers, and the tree also builds plain C
+        # (mbedtls), where "-include cstddef" is a hard error.
         foreach(_mg_prelude cstddef cstdint vector string array optional functional
                 memory mutex limits algorithm chrono map set tuple span utility)
-            add_compile_options("SHELL:-include ${_mg_prelude}")
+            add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-include>")
+            add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${_mg_prelude}>")
         endforeach()
     endif()
 else()
