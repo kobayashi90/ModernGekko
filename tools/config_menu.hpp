@@ -181,8 +181,10 @@ private:
   // overlay hook (so it works with the menu closed, which is when savestates
   // and screenshots actually run).
   bool FilterOsdMessage(std::string &message);
-  void PushToast(std::string text);
   void DrawToasts();
+  // Toasts default to the old 2 s: they report an action that just happened.
+  // A hint for someone who is not looking for anything needs longer.
+  void PushToast(std::string text, std::chrono::seconds duration = std::chrono::seconds(2));
   // Same idea for the frame counter: GFX_SHOW_FPS renders Dolphin's own
   // performance overlay, so the menu draws its own pill instead.
   void DrawFrameCounter();
@@ -274,6 +276,11 @@ private:
   };
   mutable std::mutex m_toast_mutex;
   std::vector<Toast> m_toasts;
+  // One-shot "press F1" hint for the first seconds of a session. Counted in
+  // presented frames: the boot takes a few seconds, so pushing it from Start()
+  // would have it expire before the first frame the player sees.
+  std::atomic<unsigned> m_presented_frames{0};
+  std::atomic<bool> m_startup_hint_shown{false};
   // Frame-counter bookkeeping, video thread only.
   std::chrono::steady_clock::time_point m_fps_window_start{};
   unsigned m_fps_frames = 0;

@@ -56,6 +56,9 @@ namespace {
 // XKB_KEY_F1 == XK_F1 == 0xFFBE (the F-keys start at 0xFFBE, NOT 0xFFC1 —
 // 0xFFC1 is F4) and XKB_KEY_Escape == XK_Escape == 0xFF1B: both host
 // platforms hand us X11/xkb keysyms, so plain constants work.
+// ~1 s at 50 Hz: early enough to be read over the intro, late enough that it
+// does not land on a black frame the loader has not filled in yet.
+constexpr unsigned kStartupHintFrame = 45;
 constexpr unsigned kF1Keysym = 0xFFBE;
 constexpr unsigned kEscapeKeysym = 0xFF1B;
 
@@ -653,16 +656,19 @@ bool ConfigMenu::FilterOsdMessage(std::string &message) {
   return true;
 }
 
-void ConfigMenu::PushToast(std::string text) {
+void ConfigMenu::PushToast(std::string text, std::chrono::seconds duration) {
   std::lock_guard lock(m_toast_mutex);
-  const auto expiry = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  const auto expiry = std::chrono::steady_clock::now() + duration;
   // The OSD filter forwards every surviving emulator message here, and several
   // of them repeat per frame ("No memory card in Slot A" types). Refreshing the
   // existing toast keeps one line on screen instead of cycling the same text
   // through the whole queue.
   for (Toast &toast : m_toasts) {
     if (toast.text == text) {
-      toast.expires = expiry;
+      // Never shorten a toast that is already on screen: the OSD forwards
+      // repeated emulator messages, and one of those must not cut a longer
+      // hint short.
+      toast.expires = std::max(toast.expires, expiry);
       return;
     }
   }
@@ -765,6 +771,18 @@ void ConfigMenu::DrawOverlayFrame() {
   // Proof for the regression harness that the running core actually picked up
   // a live-applied setting (only under MODERNGEKKO_MENU_DEBUG=1).
   ReportLiveState();
+  // One-shot hint on the first seconds of a session: the menu has no icon and
+  // no mention in the game, so without this the only way to find the settings
+  // is to already know F1. Counted in presented frames (boot takes seconds, a
+  // toast pushed at Start() would expire unseen) and skipped while the player
+  // already has the menu open.
+  if (!m_startup_hint_shown.load(std::memory_order_relaxed) &&
+      !m_visible.load(std::memory_order_relaxed) &&
+      m_presented_frames.fetch_add(1, std::memory_order_relaxed) + 1 >=
+          kStartupHintFrame) {
+    m_startup_hint_shown.store(true, std::memory_order_relaxed);
+    PushToast("Press F1 for the Settings Menu", std::chrono::seconds(8));
+  }
   // Presentation that belongs to the game session, not to the menu: toasts
   // replace Dolphin's OSD text and the counter replaces GFX_SHOW_FPS.
   DrawToasts();
