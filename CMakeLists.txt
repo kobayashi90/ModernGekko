@@ -16,6 +16,18 @@ if(WIN32)
     # ("SetProcessInformation" exists in its headers, but only above 0x0602).
     # One project-wide floor keeps both toolchains seeing the same API surface.
     add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000000)
+    if(NOT MSVC)
+        # The vendored Dolphin headers rely on transitive includes that MSVC's
+        # STL happens to provide (std::vector in CustomTextureData.h is the one
+        # that broke a mingw build first). Carrying a prelude is the honest
+        # version of "this tree was written against MSVC": it keeps the vendor
+        # code untouched and does not turn every rebuild into a missing-include
+        # hunt through hundreds of files we do not own.
+        foreach(_mg_prelude cstddef cstdint vector string array optional functional
+                memory mutex limits algorithm chrono map set tuple span utility)
+            add_compile_options("SHELL:-include ${_mg_prelude}")
+        endforeach()
+    endif()
 else()
     check_include_file_cxx(dlfcn.h MODERNGEKKO_HAS_DLFCN)
     set(MODERNGEKKO_DYNAMIC_MODULES_DEFAULT ${MODERNGEKKO_HAS_DLFCN})
