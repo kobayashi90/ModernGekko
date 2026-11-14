@@ -469,7 +469,13 @@ bool ConfigMenu::HotkeyThunk(void *userdata, unsigned keysym) {
   if (self->m_visible.load(std::memory_order_relaxed)) {
     if (keysym == kEscapeKeysym) {
       self->Hide();
-      return false; // let the platform keep handling e.g. Ctrl+Escape
+      // Claim it. Returning false here would hand ESC to the platform layer,
+      // and the Win32 backend treats plain ESC as "exit fullscreen, then
+      // quit" — closing the menu would kill the game one keystroke later.
+      // (Linux only binds Ctrl+ESC to quit, but claiming is correct there
+      // too: closing the menu and shutting down in the same press is not a
+      // sensible combination either.)
+      return true;
     }
     // Menu open: claim everything else so savestate/F10 hotkeys can't fire
     // mid-configuration. The key has already been fed to the menu's ImGui
